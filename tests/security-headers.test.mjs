@@ -30,4 +30,12 @@ test("production server applies browser security headers", async (t) => {
   assert.equal(response.headers.get("x-frame-options"), "DENY");
   assert.match(response.headers.get("strict-transport-security") ?? "", /max-age=63072000/);
   assert.match(response.headers.get("permissions-policy") ?? "", /camera=\(\)/);
+  const html = await response.text();
+  const stylesheet = html.match(/href="([^"]+\.css)"/)?.[1];
+  assert.ok(stylesheet, "prerendered page did not reference a stylesheet");
+  const asset = await fetch(`http://127.0.0.1:${port}${stylesheet}`);
+  assert.equal(asset.status, 200);
+  assert.match(asset.headers.get("content-type") ?? "", /^text\/css/);
+  assert.match(asset.headers.get("cache-control") ?? "", /immutable/);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/missing-file`)).status, 404);
 });

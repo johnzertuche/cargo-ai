@@ -12,6 +12,7 @@ COPY public ./public
 COPY worker ./worker
 COPY next-env.d.ts next.config.ts postcss.config.mjs tsconfig.json vite.config.ts ./
 COPY server.mjs ./
+COPY scripts/prerender.mjs ./scripts/prerender.mjs
 RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime
@@ -21,7 +22,6 @@ WORKDIR /app
 
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/server.mjs ./server.mjs
-COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 
 EXPOSE 3000
