@@ -1,0 +1,15 @@
+.git
+.github
+.next
+.wrangler
+apps
+crates
+docs
+node_modules
+outputs
+target
+tests
+work
+*.age
+*.backup
+*.vault
