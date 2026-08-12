@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimal permissions for the trusted local Cargo interface","local":true,"windows":["main"],"permissions":["core:default"]}}

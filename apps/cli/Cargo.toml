@@ -1,0 +1,19 @@
+[package]
+name = "cargo-ai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cargo-ai"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+cargo-ai-core = { path = "../../crates/core" }
+clap.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+rpassword.workspace = true

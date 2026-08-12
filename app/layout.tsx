@@ -14,14 +14,14 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000"),
-  title: "Kord — One identity for every AI capability",
-  description: "Connect your plugins, MCP servers, tools, and credentials to every AI through one secure control plane.",
+  title: "Cargo — Your AI life, owned by you",
+  description: "An open-source, local-first encrypted vault for carrying AI connections and memory between Claude, Cursor, and Codex.",
   openGraph: {
-    title: "One Kord. Every AI.",
-    description: "Connections, tools, and memory that move with you.",
-    images: [{ url: "/og.png", width: 1200, height: 630, alt: "Kord — the portable AI connection layer" }],
+    title: "Cargo — Your AI life, owned by you",
+    description: "Open-source, local-first AI portability.",
+    images: [{ url: "/cargo-og.png", width: 1731, height: 909, alt: "Cargo — your AI life, owned by you" }],
   },
-  twitter: { card: "summary_large_image", title: "One Kord. Every AI.", description: "Connections, tools, and memory that move with you.", images: ["/og.png"] },
+  twitter: { card: "summary_large_image", title: "Cargo — Your AI life, owned by you", description: "Open-source, local-first AI portability.", images: ["/cargo-og.png"] },
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cargo.local/schemas/cargo-ai-pack-v2.json",
+  "title": "Cargo portable pack",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "version", "contains_secrets", "exported_at", "profile", "connections", "memory"],
+  "properties": {
+    "format": { "const": "cargo-ai-pack" },
+    "version": { "const": 2 },
+    "contains_secrets": { "const": false },
+    "exported_at": { "type": "string", "format": "date-time" },
+    "profile": { "$ref": "#/$defs/profile" },
+    "connections": { "type": "array", "maxItems": 2000, "items": { "$ref": "#/$defs/connection" } },
+    "memory": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/$defs/memory" } }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "format": "uuid" },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "display_name", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "display_name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "transport", "command", "args", "url", "environment_keys", "metadata"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "transport": { "enum": ["stdio", "streamable_http"] },
+        "command": { "type": ["string", "null"], "maxLength": 8192 },
+        "args": { "type": "array", "maxItems": 128, "items": { "type": "string", "maxLength": 8192 } },
+        "url": { "type": ["string", "null"], "maxLength": 16384 },
+        "environment_keys": { "type": "array", "maxItems": 128, "items": { "type": "string", "minLength": 1, "maxLength": 512 }, "uniqueItems": true },
+        "metadata": { "type": "object", "maxProperties": 32, "additionalProperties": { "type": "string", "maxLength": 2048 } }
+      },
+      "oneOf": [
+        { "properties": { "transport": { "const": "stdio" }, "command": { "type": "string" }, "url": { "type": "null" } } },
+        { "properties": { "transport": { "const": "streamable_http" }, "command": { "type": "null" }, "url": { "type": "string" } } }
+      ]
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "body", "sensitivity", "allowed_hosts", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 262144 },
+        "sensitivity": { "enum": ["public", "private", "sensitive"] },
+        "allowed_hosts": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 200 } },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

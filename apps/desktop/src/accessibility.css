@@ -1,0 +1,4 @@
+:focus-visible {
+  outline: 3px solid #4b8058;
+  outline-offset: 3px;
+}

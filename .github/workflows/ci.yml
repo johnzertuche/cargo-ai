@@ -1,0 +1,62 @@
+name: Cargo CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust core and desktop boundary
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+  web:
+    name: Website and desktop renderer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: npm
+      - name: Install website dependencies
+        run: npm ci
+      - name: Test website
+        run: npm test
+      - name: Audit website production dependencies
+        run: npm audit --omit=dev
+      - name: Install desktop renderer dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Build desktop renderer
+        working-directory: apps/desktop
+        run: npm run build
+      - name: Audit desktop production dependencies
+        working-directory: apps/desktop
+        run: npm audit --omit=dev
+
+  rustsec:
+    name: RustSec audit for the macOS preview
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Reject vulnerabilities, yanked crates, and macOS unsoundness
+        run: cargo audit --target-os macos --target-arch aarch64 --deny unsound --ignore RUSTSEC-2024-0429

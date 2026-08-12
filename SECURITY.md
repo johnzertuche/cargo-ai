@@ -1,64 +1,57 @@
-# Security model
+# Security policy and threat model
 
-Kord is a prototype. The current web UI demonstrates the intended user experience; it does not yet perform real third-party authorization or write host configuration.
+Cargo is a private preview. Please do not use it as the sole custodian of irreplaceable production credentials. Connection imports intentionally discard credential values.
 
-## Trust boundaries
+## Reporting
 
-1. The control plane stores identities, manifests, policy, public metadata, and encrypted credential envelopes. It never returns provider refresh tokens to an AI host.
-2. The vault broker performs token exchange and provider API calls. Decryption keys are held in a dedicated KMS/HSM boundary, separated from the application database.
-3. The signed local agent applies local configuration and launches approved `stdio` MCP processes. It uses the operating-system credential store and requires an explicit diff approval for mutation.
-4. Remote AI hosts connect through a scoped gateway. Each host receives a distinct audience-bound credential and cannot reuse another host's session.
-5. Memory records are encrypted, typed, provenance-bearing, and evaluated against disclosure policy for every host and session.
+Do not open a public issue for a suspected vulnerability. Use GitHub's private vulnerability reporting for this repository. Include affected version/commit, platform, reproduction steps, impact, and any suggested mitigation. Do not include real secrets or personal memory records.
 
-## Authorization requirements
+## Security claims
 
-- OAuth authorization code flow with PKCE and exact redirect-URI matching.
-- `state` and nonce validation; no implicit flow.
-- Incremental, least-privilege scopes. Denied scopes disable the corresponding feature.
-- Short-lived access tokens. Rotating refresh tokens where the provider supports them.
-- Sender-constrained tokens (DPoP or mTLS) where available.
-- Secrets encrypted in transit and at rest; never logged, exported in manifests, or committed.
-- Remote MCP authorization follows current MCP authorization metadata discovery and protected-resource metadata requirements.
-- Local `stdio` credentials are injected at process launch from OS secure storage, never persisted into portable configuration.
+- Local profile, connection, memory, deployment, and receipt records are encrypted at rest with authenticated per-record encryption.
+- The vault key is stored through the platform credential store, not in SQLite or portable packs.
+- Imported JSON/TOML definitions do not retain credential values.
+- The privileged desktop backend does not load remote web content and the renderer has no generic shell/filesystem capability.
+- JSON host writes require an exact executable preview, reject stale plans, atomically replace after a second fingerprint check, preserve unrelated fields, and verify the owned fragment without retaining plaintext host-file backups.
+- Removal refuses a changed owned fragment rather than silently erasing user edits.
+- Portable packs contain explicitly selected personal data but no imported credential values. Optional passphrase protection uses the published `age` format; it is not full-vault recovery.
+- Receipts are hash-chained. The current check detects modification and ordering breaks in the records present, but cannot independently prove the newest tail was not deleted.
 
-## Revocation is a workflow, not a button
+## Threats considered
 
-Revocation creates a durable operation with an idempotency key and performs these steps:
+- A malicious AI host requesting excess scope, replaying a grant, or modifying shared configuration
+- A compromised renderer/XSS attempting arbitrary filesystem, shell, or secret access
+- Malicious MCP definitions, executables, packages, servers, adapters, updates, or dependencies
+- Crafted import files, oversized inputs, ambiguous transports, path traversal, symlink and TOCTOU attacks
+- A stolen database, backup, laptop, or unlocked session
+- OAuth callback interception, token replay, refresh-token reuse, provider outage, and partial revocation
+- Audit truncation/rollback, clock rollback, crash inconsistency, and configuration drift
+- Operator/cloud compromise of any future optional sync service
+- Secrets leaked into exports, logs, command arguments, crash dumps, clipboard, shell history, or backups
 
-1. Mark the Kord grant `revoking` so no new sessions can be minted.
-2. Invalidate Kord gateway sessions and cached access tokens immediately.
-3. Call the provider revocation endpoint when supported; delete the provider grant when a full disconnect is requested.
-4. Push removal operations to every linked host adapter and local device.
-5. Verify the provider token is rejected and each host no longer advertises the capability.
-6. Delete encrypted token material and retain only a non-secret audit receipt.
-7. Mark `revoked` only after all mandatory checks pass. Partial failures stay visible and retry with bounded backoff.
+## Non-goals and honest limits
 
-The emergency path blocks Kord-issued access immediately even if an upstream provider is unavailable. A reconciler continues provider and host cleanup until verified.
+- Cargo cannot protect plaintext from malware or an administrator controlling the OS while the vault/app is unlocked.
+- Host registration removal cannot invalidate a provider credential copied outside Cargo.
+- An encrypted portable pack cannot be recovered if its passphrase is lost.
+- The current preview does not transfer live OAuth refresh tokens and does not claim provider-side revocation.
+- The current receipt chain detects record modification and ordering breaks when read; a privileged attacker able to replace the entire database and keychain state is outside its protection.
 
-## Memory safety
+## Required future credential flow
 
-- Default disclosure posture is `ask`; sensitive records default to `local-only`.
-- Records include type, source, author, timestamp, confidence, sensitivity, allowed purposes, allowed hosts, expiry, and supersession lineage.
-- Retrieval is policy-filtered before semantic search results reach a model.
-- Models cannot silently promote conversation text into durable memory.
-- Every read and write generates a user-visible receipt. Users can inspect, correct, export, expire, or delete records.
-- Deletion removes indexes and ciphertext and schedules backup tombstoning according to the published retention window.
-- Portable exports contain encrypted records or redacted plaintext selected by the user—never vault keys.
+Any provider OAuth adapter must use the system browser, Authorization Code with PKCE S256, exact redirect URIs, one-time state/nonce validation, least privilege and audience restriction, and refresh rotation or sender constraint where available. No token may be returned to the renderer, AI host, logs, configuration export, or command line.
 
-## Supply-chain controls
+Disconnect must report these outcomes separately:
 
-- Signed manifests and adapter packages with pinned digests and provenance attestations.
-- Sandboxed adapters, explicit network/filesystem capabilities, resource limits, and egress allowlists.
-- Two-person review for publisher verification and security-sensitive adapter changes.
-- Dependency scanning, secret scanning, SBOM generation, reproducible builds, and staged rollout with rollback.
-- No silent widening of scopes during upgrades.
+1. New local grants blocked and active sessions/processes stopped
+2. Owned host configuration removed and verified
+3. Host-local OAuth credentials logged out and verified
+4. Provider revocation requested
+5. Provider rejection verified where the provider supports evidence
+6. Local encrypted material cryptographically erased
 
-## Required production validation
+Offline/provider failures remain locally blocked and pending. The UI must not say fully revoked without mandatory evidence.
 
-- Threat model using STRIDE plus abuse-case review.
-- External penetration test before holding real credentials.
-- OAuth conformance tests and provider-specific revoke/expiry test suites.
-- Adapter contract tests in disposable accounts for connect, denied scope, token rotation, expiry, revoke, reconnect, drift, and rollback.
-- Local-agent code signing, auto-update verification, and tamper response.
-- Incident response, key rotation, restore drills, and deletion verification.
+## Release security
 
+Production release requires signed/notarized binaries, signed updates, pinned lockfiles, dependency/secret/license scanning, SBOM and provenance, malicious-import and crash-consistency testing, clean-device restore testing, real adapter conformance tests, and an independent audit with remediation.

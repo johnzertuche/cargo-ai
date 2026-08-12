@@ -1,100 +1,88 @@
-# vinext-starter
+# Cargo
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Cargo is an open-source, local-first desktop vault for moving AI connection definitions and personal context between Claude, Cursor, Codex, and future clients without creating a hosted credential honeypot.
 
-## Prerequisites
+The current release is a **private preview**. It is usable for a local profile, encrypted connection and memory storage, safe/encrypted transfer, read-only client discovery, Claude Desktop/Cursor JSON imports, and previewed reversible JSON deployments. It is not yet audited for custody of live provider credentials and does not claim provider-wide OAuth revocation.
 
-- Node.js `>=22.13.0`
+## What works now
 
-## Quick Start
+- Accountless local profile protected by the operating-system keychain
+- SQLite vault with per-record XChaCha20-Poly1305 authenticated encryption
+- Discovery and credential-free import from documented Claude Desktop, Cursor, and Codex configuration locations
+- Typed local memory with sensitivity and allowed-host metadata
+- Credential-free JSON portable packs with explicit per-record export selection
+- Passphrase-encrypted `age` portable packs with previewed, transactional, idempotent merge
+- Two-phase install flow for Claude Desktop/Cursor JSON and the official Codex/Claude Code CLIs: exact executable preview, explicit approval, verification, receipt
+- Drift-safe removal of only the JSON fragment Cargo installed
+- Hash-chained local receipts with an explicit tail-truncation limitation
+- Shared Rust core used by the desktop app and CLI
+- Strict Tauri CSP and a small explicit command surface
+
+## Explicit limits
+
+- Import discards credential values. A destination must be authorized through its own secure flow.
+- Claude remote connectors are managed by Claude's native Connectors UI, not its local JSON configuration.
+- Codex and Claude Code registration uses their official `mcp` CLIs with user-visible arguments, a minimal environment, and post-command registration verification.
+- Removing a host registration does not revoke an upstream provider token that another app copied.
+- Memory allowed-host policy is stored and portable; automatic runtime injection/enforcement is not enabled in this preview.
+- A fully compromised operating system can access an unlocked local application. See [SECURITY.md](SECURITY.md).
+
+## Desktop app
+
+Prerequisites: macOS, Node.js 22+, and current stable Rust.
 
 ```bash
+git clone https://github.com/johnzertuche/cargo-ai.git
+cd cargo-ai/apps/desktop
 npm install
-npm run dev
-npm run build
+npm run desktop:dev
 ```
 
-This starter does not use `wrangler.jsonc`.
+Create an unsigned local application bundle:
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm run desktop:build
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+The app calls account creation **Create local profile** because no vendor account is involved. The vault key is stored in macOS Keychain and the encrypted database remains in the normal per-user application-data directory.
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+## CLI
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+```bash
+cargo run -p cargo-ai-cli -- init --name "Ada"
+cargo run -p cargo-ai-cli -- status
+cargo run -p cargo-ai-cli -- discover
+cargo run -p cargo-ai-cli -- connections
+printf 'Prefer concise updates' | cargo run -p cargo-ai-cli -- memory add --title "Working style"
+cargo run -p cargo-ai-cli -- export-safe cargo-ai-portable-pack.json
+cargo run -p cargo-ai-cli -- export-encrypted cargo-ai-portable-pack.age
+cargo run -p cargo-ai-cli -- import-encrypted cargo-ai-portable-pack.age
+```
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+## Repository layout
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+- `crates/core` — encrypted vault, transfer format, discovery, transaction and removal engine
+- `apps/desktop` — Tauri 2 desktop app
+- `apps/cli` — command-line interface using the same core
+- `app` — public website; it never reads the local vault
+- `ARCHITECTURE.md` — trust boundaries, formats, adapter contract, and release gates
+- `SECURITY.md` — threat model, reporting, claims, and non-goals
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
+## Verification
 
-## Useful Commands
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cd apps/desktop && npm run build
+cd ../.. && npm test
+```
 
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+The test suite includes encrypted-at-rest checks, wrong-key and wrong-passphrase rejection, malicious URL/symlink rejection, argument and URL secret redaction, bounded transactional import, stale-plan rejection, unrelated-field preservation, and drift-safe removal.
 
-## Learn More
+## Release policy
 
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+An unsigned local build is not a production release. A public credential-custody release additionally requires signed and notarized binaries, signed updates, SBOM/provenance, provider-specific connect/logout/revoke conformance tests, clean-device backup restore tests, and an independent security audit with remediation.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

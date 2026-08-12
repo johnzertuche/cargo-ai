@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+**/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -35,6 +36,15 @@ yarn-error.log*
 .vercel
 
 /dist/
+**/dist/
 /.wrangler/
 /outputs/
 /work/
+
+# Rust / desktop
+/target/
+**/target/
+*.age
+*.vault
+*.backup
+local-data/

@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated build and dependency trees are scanned through their lockfiles and upstream audit tools."
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)dist/''',
+  '''(^|/)\.vinext/''',
+  '''(^|/)\.next/''',
+  '''(^|/)\.wrangler/'''
+]
