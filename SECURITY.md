@@ -1,6 +1,6 @@
 # Security model
 
-Relay is a prototype. The current web UI demonstrates the intended user experience; it does not yet perform real third-party authorization or write host configuration.
+Kord is a prototype. The current web UI demonstrates the intended user experience; it does not yet perform real third-party authorization or write host configuration.
 
 ## Trust boundaries
 
@@ -25,15 +25,15 @@ Relay is a prototype. The current web UI demonstrates the intended user experien
 
 Revocation creates a durable operation with an idempotency key and performs these steps:
 
-1. Mark the Relay grant `revoking` so no new sessions can be minted.
-2. Invalidate Relay gateway sessions and cached access tokens immediately.
+1. Mark the Kord grant `revoking` so no new sessions can be minted.
+2. Invalidate Kord gateway sessions and cached access tokens immediately.
 3. Call the provider revocation endpoint when supported; delete the provider grant when a full disconnect is requested.
 4. Push removal operations to every linked host adapter and local device.
 5. Verify the provider token is rejected and each host no longer advertises the capability.
 6. Delete encrypted token material and retain only a non-secret audit receipt.
 7. Mark `revoked` only after all mandatory checks pass. Partial failures stay visible and retry with bounded backoff.
 
-The emergency path blocks Relay-issued access immediately even if an upstream provider is unavailable. A reconciler continues provider and host cleanup until verified.
+The emergency path blocks Kord-issued access immediately even if an upstream provider is unavailable. A reconciler continues provider and host cleanup until verified.
 
 ## Memory safety
 

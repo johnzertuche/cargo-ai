@@ -14,14 +14,14 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000"),
-  title: "Relay — One identity for every AI capability",
+  title: "Kord — One identity for every AI capability",
   description: "Connect your plugins, MCP servers, tools, and credentials to every AI through one secure control plane.",
   openGraph: {
-    title: "Every tool. Every AI. One link.",
-    description: "The portable AI connection layer.",
-    images: [{ url: "/og.png", width: 1200, height: 630, alt: "Relay — the portable AI connection layer" }],
+    title: "One Kord. Every AI.",
+    description: "Connections, tools, and memory that move with you.",
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: "Kord — the portable AI connection layer" }],
   },
-  twitter: { card: "summary_large_image", title: "Every tool. Every AI. One link.", description: "The portable AI connection layer.", images: ["/og.png"] },
+  twitter: { card: "summary_large_image", title: "One Kord. Every AI.", description: "Connections, tools, and memory that move with you.", images: ["/og.png"] },
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

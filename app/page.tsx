@@ -1,196 +1,103 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { siClaude, siCursor, siGithub, siX, siLinear, siPostgresql, siNotion } from "simple-icons";
 
-type Host = { name: string; mark: string; status: "Connected" | "Ready" | "Not linked"; tone: string };
+type Host = { name: string; status: "Connected" | "Ready" | "Not linked" };
+type Capability = { name: string; detail: string; status: string; scopes: string };
+type MemoryRecord = { type: string; title: string; content: string; disclosure: string };
+type Screen = "overview" | "stack" | "memory" | "activity";
 
-const initialHosts: Host[] = [
-  { name: "Claude", mark: "A", status: "Connected", tone: "sand" },
-  { name: "Cursor", mark: "C", status: "Connected", tone: "white" },
-  { name: "Codex", mark: "O", status: "Ready", tone: "green" },
-  { name: "GitHub", mark: "GH", status: "Not linked", tone: "white" },
-  { name: "Grok", mark: "X", status: "Not linked", tone: "white" },
+const iconMap = { Claude: siClaude, Cursor: siCursor, GitHub: siGithub, Grok: siX, Linear: siLinear, Postgres: siPostgresql, Notion: siNotion } as const;
+const seedHosts: Host[] = [{ name:"Claude",status:"Connected"},{name:"Cursor",status:"Connected"},{name:"Codex",status:"Ready"},{name:"GitHub",status:"Not linked"},{name:"Grok",status:"Not linked"}];
+const seedCapabilities: Capability[] = [
+  {name:"GitHub",detail:"Repositories · Issues · Pull requests",status:"Healthy",scopes:"Read & write"},
+  {name:"Linear",detail:"Issues · Projects · Teams",status:"Healthy",scopes:"Read & write"},
+  {name:"Slack",detail:"Messages · Channels · Search",status:"Healthy",scopes:"Read only"},
+  {name:"Postgres",detail:"Local MCP · analytics-prod",status:"Healthy",scopes:"Query only"},
+  {name:"Browser",detail:"Local MCP · Chromium",status:"Healthy",scopes:"Open & interact"},
+  {name:"Notion",detail:"Pages · Databases · Search",status:"Reauth",scopes:"Read only"},
+];
+const seedMemory: MemoryRecord[] = [
+  {type:"PROFILE",title:"About me",content:"Founder and operator focused on building durable, high-leverage businesses.",disclosure:"All connected AI"},
+  {type:"STYLE",title:"How I like to work",content:"Move quickly, verify deeply, communicate outcomes clearly, and avoid unnecessary friction.",disclosure:"Coding AI only"},
+  {type:"PREFERENCE",title:"Communication",content:"Concise by default. Surface risks early. Ask only when the choice materially changes the outcome.",disclosure:"All connected AI"},
+  {type:"CONTEXT",title:"Active product",content:"Building Kord: a portable capability and memory layer for moving seamlessly between AI platforms.",disclosure:"Selected sessions"},
 ];
 
-const capabilities = [
-  { name: "GitHub", detail: "Repositories · Issues · Pull requests", mark: "GH", status: "Healthy", scopes: "Read & write" },
-  { name: "Linear", detail: "Issues · Projects · Teams", mark: "LI", status: "Healthy", scopes: "Read & write" },
-  { name: "Slack", detail: "Messages · Channels · Search", mark: "SL", status: "Healthy", scopes: "Read only" },
-  { name: "Postgres", detail: "Local MCP · analytics-prod", mark: "PG", status: "Healthy", scopes: "Query only" },
-  { name: "Browser", detail: "Local MCP · Chromium", mark: "BR", status: "Healthy", scopes: "Open & interact" },
-  { name: "Notion", detail: "Pages · Databases · Search", mark: "NO", status: "Reauth", scopes: "Read only" },
-];
+function Logo({ name, size="md" }: { name:string; size?:"sm"|"md"|"lg" }) {
+  const icon = iconMap[name as keyof typeof iconMap];
+  if (!icon) return <span className={`brand-icon fallback ${size}`}>{name === "Codex" ? "◎" : name.slice(0,2).toUpperCase()}</span>;
+  return <span className={`brand-icon ${size}`} title={icon.title}><svg viewBox="0 0 24 24" role="img" aria-label={`${icon.title} logo`}><path d={icon.path}/></svg></span>;
+}
 
 export default function Home() {
-  const [entered, setEntered] = useState(false);
-  const [view, setView] = useState<"home" | "stack" | "memory" | "activity">("home");
-  const [flow, setFlow] = useState<"closed" | "host" | "review" | "deploying" | "done">("closed");
-  const [selectedHost, setSelectedHost] = useState("Codex");
-  const [hosts, setHosts] = useState(initialHosts);
-  const [selected, setSelected] = useState(capabilities.map((c) => c.name));
-  const [toast, setToast] = useState("");
+  const [entered,setEntered]=useState(false);
+  const [screen,setScreen]=useState<Screen>("overview");
+  const [hosts,setHosts]=useState(seedHosts);
+  const [caps,setCaps]=useState(seedCapabilities);
+  const [memory,setMemory]=useState(seedMemory);
+  const [selected,setSelected]=useState(seedCapabilities.map(x=>x.name));
+  const [modal,setModal]=useState<"closed"|"import"|"host"|"review"|"deploy"|"done">("closed");
+  const [target,setTarget]=useState("Codex");
+  const [report,setReport]=useState<{source:string;connections:number;memories:number}|null>(null);
+  const [toast,setToast]=useState("");
+  const fileRef=useRef<HTMLInputElement>(null);
+  const connected=useMemo(()=>hosts.filter(x=>x.status==="Connected").length,[hosts]);
 
-  const activeCount = useMemo(() => hosts.filter((h) => h.status === "Connected").length, [hosts]);
+  useEffect(()=>{const raw=localStorage.getItem("kord-device-vault");if(raw)try{const d=JSON.parse(raw);if(d.hosts)setHosts(d.hosts);if(d.connections)setCaps(d.connections);if(d.memory)setMemory(d.memory)}catch{localStorage.removeItem("kord-device-vault")}},[]);
+  useEffect(()=>{localStorage.setItem("kord-device-vault",JSON.stringify({version:1,hosts,connections:caps,memory}))},[hosts,caps,memory]);
+  useEffect(()=>{if(!toast)return;const t=setTimeout(()=>setToast(""),2800);return()=>clearTimeout(t)},[toast]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = setTimeout(() => setToast(""), 2800);
-    return () => clearTimeout(timer);
-  }, [toast]);
-
-  function toggleCapability(name: string) {
-    setSelected((prev) => prev.includes(name) ? prev.filter((x) => x !== name) : [...prev, name]);
+  function exportPack(){
+    const pack={format:"kord-pack",version:1,exportedAt:new Date().toISOString(),connections:caps.map(({name,detail,scopes})=>({name,detail,scopes})),memory,hosts:hosts.map(({name,status})=>({name,status}))};
+    const url=URL.createObjectURL(new Blob([JSON.stringify(pack,null,2)],{type:"application/json"}));const a=document.createElement("a");a.href=url;a.download=`kord-pack-${new Date().toISOString().slice(0,10)}.json`;a.click();URL.revokeObjectURL(url);setToast("Kord Pack exported · credentials excluded");
   }
-
-  function deploy() {
-    setFlow("deploying");
-    setTimeout(() => {
-      setHosts((prev) => prev.map((h) => h.name === selectedHost ? { ...h, status: "Connected" } : h));
-      setFlow("done");
-    }, 1700);
+  async function importFile(file?:File){
+    if(!file)return;const raw=await file.text();let parsed:Record<string,unknown>={};
+    try{parsed=JSON.parse(raw)}catch{const items=[...raw.matchAll(/^##?\s+(.+)$/gm)].map(m=>({type:"IMPORTED",title:m[1],content:`Imported from ${file.name}`,disclosure:"Ask first"}));setMemory(p=>[...p,...items]);setReport({source:file.name,connections:0,memories:items.length});setModal("import");return}
+    if(parsed.format==="kord-pack"){
+      const cs=Array.isArray(parsed.connections)?parsed.connections as Capability[]:[];const ms=Array.isArray(parsed.memory)?parsed.memory as MemoryRecord[]:[];
+      setCaps(p=>[...p,...cs.filter(x=>x.name&&!p.some(y=>y.name===x.name)).map(x=>({...x,status:x.status||"Needs auth"}))]);setMemory(p=>[...p,...ms.filter(x=>x.title&&!p.some(y=>y.title===x.title))]);setReport({source:file.name,connections:cs.length,memories:ms.length});setModal("import");return
+    }
+    const mcp=(parsed.mcpServers||parsed.servers||(parsed.mcp as Record<string,unknown>|undefined)?.servers) as Record<string,unknown>|undefined;const names=mcp&&typeof mcp==="object"?Object.keys(mcp):[];
+    const found=names.map(name=>({name,detail:`Imported MCP · ${file.name}`,status:"Needs auth",scopes:"Review required"}));setCaps(p=>[...p,...found.filter(x=>!p.some(y=>y.name===x.name))]);setReport({source:file.name,connections:found.length,memories:0});setModal("import");
   }
+  function deploy(){setModal("deploy");setTimeout(()=>{setHosts(p=>p.map(h=>h.name===target?{...h,status:"Connected"}:h));setModal("done")},1300)}
+  function revoke(){setHosts(p=>p.map(h=>h.name===target?{...h,status:"Not linked"}:h));setModal("closed");setToast(`${target} disconnected · Kord grant revoked`)}
 
-  const title = view === "home" ? "Your AI stack, everywhere." : view === "stack" ? "Capability stack" : view === "memory" ? "Portable memory" : "Activity & security";
+  if(!entered)return <main className="landing">
+    <header className="landing-nav"><button className="brand"><span className="kord-mark">K</span><span>KORD</span></button><nav><a href="#product">Product</a><a href="#security">Security</a><a href="#platforms">Platforms</a></nav><button className="launch-link" onClick={()=>setEntered(true)}>Open Kord <span>→</span></button></header>
+    <section className="landing-hero"><div className="hero-kicker"><i/>THE PORTABLE AI CONNECTION LAYER</div><h1>One Kord.<br/><em>Every AI.</em></h1><p>Carry your tools, connections, and memory from Claude to Cursor to Codex—without rebuilding who you are or how you work.</p><div className="hero-actions"><button onClick={()=>setEntered(true)}>Open the working app <span>→</span></button><a href="#product">See how it works</a></div><div className="trust-strip"><span>Import anywhere</span><span>Authorize once</span><span>Revoke instantly</span><span>Export anytime</span></div><div className="hero-network"> <div className="network-core"><span className="kord-mark large">K</span><small>KORD PACK</small></div>{seedHosts.map((h,i)=><div className={`network-node n${i+1}`} key={h.name}><Logo name={h.name}/><span>{h.name}</span></div>)}<i className="beam b1"/><i className="beam b2"/><i className="beam b3"/><i className="beam b4"/><i className="beam b5"/></div></section>
+    <section className="name-story"><span>WHY KORD</span><p>A <b>cord</b> makes a connection. Kord makes it portable. Connect once, carry the relationship everywhere—and when trust ends, <b>cut the Kord</b> with verified revocation across every linked AI.</p></section>
+    <section className="landing-proof" id="product"><div><span>01 / PORTABILITY</span><h2>Your AI stack should<br/>move when you do.</h2></div><p>Import host configuration and memory into one credential-free Kord Pack. Kord normalizes the definitions, then asks you to authorize each provider once—never copying unsafe tokens between apps.</p><div className="proof-flow"><article><b>01</b><strong>Import</strong><small>Claude, Cursor, Codex, MCP JSON, memory files.</small></article><i>→</i><article><b>02</b><strong>Normalize</strong><small>One open, inspectable Kord Pack.</small></article><i>→</i><article className="accent"><b>03</b><strong>Authorize</strong><small>One fresh grant per provider, scoped by policy.</small></article><i>→</i><article><b>04</b><strong>Carry</strong><small>Deploy safely into each supported AI host.</small></article></div></section>
+    <section className="landing-split" id="security"><div className="vault-visual"><span>CUT THE KORD</span><div className="vault-rings"><i/><i/><i/><b>×</b></div><p>One action. Every session blocked. Every endpoint verified.</p></div><div className="security-copy"><span>02 / REVOCATION</span><h2>Disconnect should mean<br/>disconnected.</h2><p>Kord blocks new sessions first, revokes the provider grant, removes host configuration, verifies rejection, deletes encrypted material, and issues a receipt.</p><ul><li><b>Immediate containment</b><span>New Kord sessions stop before upstream cleanup begins.</span></li><li><b>Verified removal</b><span>Every adapter must prove the capability disappeared.</span></li><li><b>No silent failure</b><span>Partial revocation remains visible and retries safely.</span></li></ul></div></section>
+    <section className="platform-band" id="platforms"><p>ONE KORD / EVERY AI SURFACE</p><div>{seedHosts.map(h=><span className="platform-logo" key={h.name}><Logo name={h.name}/>{h.name}</span>)}</div></section>
+    <section className="landing-cta"><p>NO DOWNTIME. NO REINTRODUCTIONS.</p><h2>Take your AI life with you.</h2><button onClick={()=>setEntered(true)}>Build your first Kord Pack <span>→</span></button></section>
+    <footer className="landing-footer"><span className="brand"><span className="kord-mark small">K</span><span>KORD</span></span><p>Portable identity and capability infrastructure.</p><small>© 2026 · Private device prototype</small></footer>
+  </main>;
 
-  if (!entered) return (
-    <main className="landing">
-      <header className="landing-nav">
-        <button className="brand" aria-label="Home"><span className="brand-mark">R</span><span>RELAY</span><small>WORKING TITLE</small></button>
-        <nav><a href="#product">Product</a><a href="#security">Security</a><a href="#platforms">Platforms</a></nav>
-        <button className="launch-link" onClick={() => setEntered(true)}>Open prototype <span>→</span></button>
-      </header>
-      <section className="landing-hero">
-        <div className="hero-kicker"><i /> THE PORTABLE AI CONNECTION LAYER</div>
-        <h1>Every tool.<br />Every AI. <em>One link.</em></h1>
-        <p>Bring your plugins, MCP servers, credentials, and workflows into any AI—without rebuilding your stack from scratch.</p>
-        <div className="hero-actions"><button onClick={() => setEntered(true)}>Explore the control plane <span>→</span></button><a href="#product">See how it works</a></div>
-        <div className="trust-strip"><span>Local-first controls</span><span>Encrypted credentials</span><span>Explicit consent</span><span>Instant rollback</span></div>
-        <div className="hero-network" aria-hidden="true">
-          <div className="network-core"><span className="brand-mark">R</span><small>YOUR LINK</small></div>
-          {[["A","Claude"],["C","Cursor"],["O","Codex"],["GH","GitHub"],["X","Grok"]].map(([mark,name],i)=><div className={`network-node n${i+1}`} key={name}><b>{mark}</b><span>{name}</span></div>)}
-          <i className="beam b1"/><i className="beam b2"/><i className="beam b3"/><i className="beam b4"/><i className="beam b5"/>
-        </div>
-      </section>
-      <section className="landing-proof" id="product">
-        <div><span>01 / IMPORT</span><h2>Your stack already exists.<br />We make it portable.</h2></div>
-        <p>Relay discovers your existing plugins, MCP servers, skills, rules, and connected accounts—then turns them into one signed, portable manifest.</p>
-        <div className="proof-flow"><article><b>01</b><strong>Discover</strong><small>Scan every AI client and local configuration.</small></article><i>→</i><article><b>02</b><strong>Normalize</strong><small>Resolve duplicates and map capabilities.</small></article><i>→</i><article className="accent"><b>03</b><strong>Secure</strong><small>Move secrets behind an encrypted broker.</small></article><i>→</i><article><b>04</b><strong>Deploy</strong><small>Generate safe, host-native configuration.</small></article></div>
-      </section>
-      <section className="landing-split" id="security">
-        <div className="vault-visual"><span>RELAY VAULT</span><div className="vault-rings"><i/><i/><i/><b>✓</b></div><p>Credentials never move between AI hosts.</p></div>
-        <div className="security-copy"><span>02 / TRUST LAYER</span><h2>The connection is the product.<br />Trust is the moat.</h2><p>Every installation is previewed. Every permission is explicit. Every mutation is signed, logged, and reversible.</p><ul><li><b>Credential isolation</b><span>Short-lived tokens, device-bound keys, zero plaintext sync.</span></li><li><b>Capability-level consent</b><span>Control exactly what each AI can read, write, and trigger.</span></li><li><b>Supply-chain verification</b><span>Publisher identity, package digest, provenance, and version checks.</span></li></ul></div>
-      </section>
-      <section className="platform-band" id="platforms"><p>ONE CONTROL PLANE / EVERY AI SURFACE</p><div>{["CLAUDE","CURSOR","CODEX","GITHUB","GROK","+ ANY MCP CLIENT"].map(x=><span key={x}>{x}</span>)}</div></section>
-      <section className="landing-cta"><p>THE END OF INTEGRATION SPRAWL</p><h2>Your AI stack should follow you.</h2><button onClick={() => setEntered(true)}>Open the working prototype <span>→</span></button></section>
-      <footer className="landing-footer"><span className="brand"><span className="brand-mark small">R</span><span>RELAY</span></span><p>Portable capability infrastructure for the AI era.</p><small>© 2026 · Working prototype</small></footer>
-    </main>
-  );
+  const screenTitle={overview:"Your AI life, connected.",stack:"Connections & tools",memory:"Portable memory",activity:"Security & activity"}[screen];
+  return <main className="app-shell">
+    <input ref={fileRef} type="file" accept=".json,.md,.txt" hidden onChange={e=>importFile(e.target.files?.[0])}/>
+    <aside className="sidebar"><button className="brand" onClick={()=>setScreen("overview")}><span className="kord-mark">K</span><span>KORD</span></button><nav>{([['overview','⌂','Overview'],['stack','◇','Connections'],['memory','◎','Memory'],['activity','↗','Activity']] as const).map(([id,g,label])=><button key={id} className={screen===id?"nav-item active":"nav-item"} onClick={()=>setScreen(id)}><span className="nav-glyph">{g}</span>{label}<span className="nav-count">{id==='stack'?caps.length:id==='memory'?memory.length:''}</span></button>)}</nav><div className="sidebar-label">AI HOSTS</div><div className="host-nav">{hosts.map(h=><button key={h.name} onClick={()=>{setTarget(h.name);setModal(h.status==="Connected"?"review":"host")}}><Logo name={h.name} size="sm"/><span>{h.name}</span><i className={h.status==="Connected"?"online":""}/></button>)}</div><div className="sidebar-bottom"><div className="security-note"><span className="shield">✓</span><div><strong>Private device mode</strong><small>Stored only in this browser</small></div></div></div></aside>
+    <section className="workspace"><header className="topbar"><div className="crumb"><span>Personal Kord</span><b>/</b><span>{screenTitle}</span></div><div className="top-actions"><button className="export-button" onClick={exportPack}>↓ Export Pack</button><button className="connect-button" onClick={()=>setModal("host")}>＋ Connect AI</button></div></header><div className="content"><div className="page-heading"><div><p className="eyebrow">KORD CONTROL PLANE / LOCAL</p><h1>{screenTitle}</h1><p>{screen==="overview"?"Connections, tools, and context that follow you—without sharing raw credentials.":screen==="stack"?"Import definitions, review authentication, and control every connected capability.":screen==="memory"?"User-owned context with explicit per-host disclosure controls.":"Every import, deployment, permission change, and revocation has a receipt."}</p></div>{screen==="overview"&&<button className="quiet-action" onClick={()=>fileRef.current?.click()}>↑ Import from AI</button>}</div>
+      {screen==="overview"&&<><section className="signal-grid"><article className="hero-signal"><div className="signal-top"><span className="pulse"><i/></span><span>KORD PACK HEALTHY</span></div><div className="hero-number">{connected}<small> / 5</small></div><h2>AI hosts connected</h2><p>Your pack persists on this device and is ready to export.</p><button onClick={()=>setModal("host")}>Connect another AI <span>→</span></button><div className="orbit orbit-one"/><div className="orbit orbit-two"/><div className="core-dot"/></article><article className="metric-card"><div className="metric-label">CONNECTIONS</div><strong>{caps.length}</strong><p>{caps.filter(c=>c.status==="Healthy").length} verified · {caps.filter(c=>c.status!=="Healthy").length} require review</p><div className="meter"><i style={{width:"82%"}}/></div><button onClick={()=>setScreen("stack")}>Open inventory <span>↗</span></button></article><article className="metric-card"><div className="metric-label">PORTABLE MEMORY</div><strong>{memory.length}</strong><p>Typed records · policy filtered</p><div className="meter"><i style={{width:"94%"}}/></div><button onClick={()=>setScreen("memory")}>Review memory <span>↗</span></button></article></section><section className="section-block"><div className="section-title"><div><h2>Connected AI</h2><p>Actual host brands. Independent Kord grants.</p></div><button onClick={()=>setModal("host")}>Manage hosts</button></div><div className="host-cards">{hosts.map(h=><button className="host-card" key={h.name} onClick={()=>{setTarget(h.name);setModal(h.status==="Connected"?"review":"host")}}><Logo name={h.name} size="lg"/><div><strong>{h.name}</strong><small>{h.status==="Connected"?"Verified on this device":"Available adapter"}</small></div><span className={`status ${h.status==="Connected"?"good":""}`}>{h.status}</span></button>)}</div></section><section className="quick-transfer"><div><span>PORTABILITY TEST</span><h2>Take everything with you.</h2><p>Download a credential-free package containing connection definitions, permissions, and memory. Import it into another Kord session and review the exact diff.</p></div><div><button onClick={()=>fileRef.current?.click()}>↑ Import AI config</button><button className="primary" onClick={exportPack}>↓ Export Kord Pack</button></div></section></>}
+      {screen==="stack"&&<section className="stack-panel"><div className="stack-toolbar"><div><strong>Default Kord Pack</strong><span className="version">v2.0</span><p>{caps.length} definitions · credentials excluded from exports</p></div><button onClick={()=>fileRef.current?.click()}>↑ Import from AI</button></div><div className="cap-table-head"><span>CONNECTION</span><span>ACCESS</span><span>HEALTH</span><span/></div>{caps.map(c=><div className="cap-row" key={c.name}><span className="cap-id"><Logo name={c.name}/><span><strong>{c.name}</strong><small>{c.detail}</small></span></span><span>{c.scopes}</span><span className={c.status==="Healthy"?"health good":"health warn"}><i/>{c.status}</span><button onClick={()=>setToast(`${c.name} inspection opened`)}>•••</button></div>)}</section>}
+      {screen==="memory"&&<section className="memory-layout"><div className="memory-main"><div className="memory-banner"><span className="shield large">✓</span><div><strong>You own this memory.</strong><p>Records are carried in your Kord Pack; AI hosts receive only the fields permitted for that host.</p></div><button onClick={exportPack}>Export vault</button></div><div className="memory-section-title"><div><strong>Identity & preferences</strong><small>{memory.length} portable records</small></div><button onClick={()=>fileRef.current?.click()}>↑ Import memory</button></div>{memory.map(m=><article className="memory-card" key={m.title}><div><span>{m.type}</span><strong>{m.title}</strong></div><p>{m.content}</p><footer><span><i/>{m.disclosure}</span><button onClick={()=>setToast(`${m.title} disclosure opened`)}>Manage access</button></footer></article>)}</div><aside className="memory-policy"><p className="modal-eyebrow">DISCLOSURE POLICY</p><h2>Context without oversharing.</h2><p>Memory is filtered for every host, workspace, purpose, and session.</p>{[["Default posture","Ask first"],["Sensitive records","Local only"],["Provenance","Required"],["Automatic expiry","90 days"]].map(x=><div className="policy-stat" key={x[0]}><span>{x[0]}</span><b>{x[1]}</b></div>)}<button onClick={()=>setToast("Disclosure policy opened")}>Edit disclosure policy →</button></aside></section>}
+      {screen==="activity"&&<section className="audit-panel"><div className="audit-hero"><span className="shield large">✓</span><div><h2>Every action is receipted.</h2><p>Revocation is considered complete only after the provider and host adapter verify removal.</p></div><span>DEVICE STATE VERIFIED</span></div>{[["Now","Kord Pack opened","Local browser vault","No credentials exposed","Verified"],["2 min ago","Cursor synchronized","6 definitions checked","Observed state matches","Success"],["48 min ago","GitHub scope changed","Pull requests","Read → Read & write","Verified"],["Yesterday","Claude connected","Authorization receipt","Host-specific grant","Success"]].map(r=><div className="audit-row" key={r[0]+r[1]}><time>{r[0]}</time><div><strong>{r[1]}</strong><small>{r[2]}</small></div><span>{r[3]}</span><b>✓ {r[4]}</b></div>)}</section>}
+    </div></section>
 
-  return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <button className="brand" onClick={() => setView("home")} aria-label="Relay home"><span className="brand-mark">R</span><span>RELAY</span></button>
-        <nav aria-label="Primary navigation">
-          <button className={view === "home" ? "nav-item active" : "nav-item"} onClick={() => setView("home")}><span className="nav-glyph">⌂</span>Overview</button>
-          <button className={view === "stack" ? "nav-item active" : "nav-item"} onClick={() => setView("stack")}><span className="nav-glyph">◇</span>My stack <span className="nav-count">{capabilities.length}</span></button>
-          <button className={view === "memory" ? "nav-item active" : "nav-item"} onClick={() => setView("memory")}><span className="nav-glyph">◎</span>Memory <span className="nav-count">12</span></button>
-          <button className={view === "activity" ? "nav-item active" : "nav-item"} onClick={() => setView("activity")}><span className="nav-glyph">↗</span>Activity</button>
-        </nav>
-        <div className="sidebar-label">AI HOSTS</div>
-        <div className="host-nav">
-          {hosts.map((host) => <button key={host.name} onClick={() => { setSelectedHost(host.name); setFlow("review"); }}><span className={`mini-mark ${host.tone}`}>{host.mark}</span><span>{host.name}</span><i className={host.status === "Connected" ? "online" : ""} /></button>)}
-        </div>
-        <div className="sidebar-bottom">
-          <div className="security-note"><span className="shield">✓</span><div><strong>Vault secured</strong><small>End-to-end encrypted</small></div></div>
-          <button className="profile"><span>Z</span><div><strong>Zertuche</strong><small>Personal workspace</small></div><b>•••</b></button>
-        </div>
-      </aside>
-
-      <section className="workspace">
-        <header className="topbar">
-          <div className="crumb"><span>Personal</span><b>/</b><span>{view === "home" ? "Overview" : view === "stack" ? "My stack" : view === "memory" ? "Memory" : "Activity"}</span></div>
-          <div className="top-actions"><button className="icon-button" aria-label="Search">⌕</button><button className="icon-button" aria-label="Notifications">◌</button><button className="connect-button" onClick={() => setFlow("host")}><span>＋</span> Connect AI</button></div>
-        </header>
-
-        <div className="content">
-          <div className="page-heading">
-            <div><p className="eyebrow">CONTROL PLANE / LIVE</p><h1>{title}</h1><p>{view === "home" ? "One secure connection layer for every tool you use and every AI you trust." : view === "stack" ? "Your portable tools, permissions, and connection health in one place." : view === "memory" ? "A user-owned context vault that moves with you—shared selectively, never silently." : "A complete record of installs, access, configuration changes, and trust events."}</p></div>
-            {view === "home" && <button className="quiet-action" onClick={() => { setView("stack"); setToast("Stack scan complete"); }}>↻ Scan this device</button>}
-          </div>
-
-          {view === "home" && <>
-            <section className="signal-grid">
-              <article className="hero-signal"><div className="signal-top"><span className="pulse"><i /></span><span>ALL SYSTEMS OPERATIONAL</span></div><div className="hero-number">{activeCount}<small> / 5</small></div><h2>AI hosts connected</h2><p>Your default Link is synchronized across every active host.</p><button onClick={() => setFlow("host")}>Extend your stack <span>→</span></button><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="core-dot" /></article>
-              <article className="metric-card"><div className="metric-label">CAPABILITIES</div><strong>{capabilities.length}</strong><p>5 healthy · 1 needs attention</p><div className="meter"><i style={{ width: "84%" }} /></div><button onClick={() => setView("stack")}>Manage stack <span>↗</span></button></article>
-              <article className="metric-card"><div className="metric-label">SECURITY SCORE</div><strong>98<span>%</span></strong><p>No critical permissions detected</p><div className="meter"><i style={{ width: "98%" }} /></div><button onClick={() => setView("activity")}>View audit log <span>↗</span></button></article>
-            </section>
-
-            <section className="section-block">
-              <div className="section-title"><div><h2>Connected AI</h2><p>Your Link adapts to each host’s native capability format.</p></div><button onClick={() => setFlow("host")}>Manage hosts</button></div>
-              <div className="host-cards">
-                {hosts.map((host) => <button className="host-card" key={host.name} onClick={() => { setSelectedHost(host.name); setFlow(host.status === "Connected" ? "review" : "host"); }}><span className={`host-mark ${host.tone}`}>{host.mark}</span><div><strong>{host.name}</strong><small>{host.status === "Connected" ? "Synced 2m ago" : host.status === "Ready" ? "Ready to deploy" : "Available"}</small></div><span className={`status ${host.status === "Connected" ? "good" : ""}`}>{host.status}</span></button>)}
-              </div>
-            </section>
-
-            <section className="section-block recent">
-              <div className="section-title"><div><h2>Recent activity</h2><p>Verified changes across your connection layer.</p></div><button onClick={() => setView("activity")}>View all</button></div>
-              <div className="activity-row"><span className="activity-icon good">✓</span><div><strong>Cursor synchronized</strong><small>6 capabilities verified · Default Link</small></div><time>2 min ago</time></div>
-              <div className="activity-row"><span className="activity-icon">↻</span><div><strong>GitHub permission updated</strong><small>Pull requests: read → read & write</small></div><time>48 min ago</time></div>
-              <div className="activity-row"><span className="activity-icon warn">!</span><div><strong>Notion authorization expires soon</strong><small>Reconnect to prevent interruption</small></div><time>3 hr ago</time></div>
-            </section>
-          </>}
-
-          {view === "stack" && <section className="stack-panel">
-            <div className="stack-toolbar"><div><strong>Default Link</strong><span className="version">v1.8</span><p>Portable across {activeCount} connected hosts</p></div><button onClick={() => { setSelected(capabilities.map((c) => c.name)); setToast("Device scan found 6 capabilities"); }}>＋ Import capability</button></div>
-            <div className="cap-table-head"><span>CAPABILITY</span><span>ACCESS</span><span>HEALTH</span><span /></div>
-            {capabilities.map((cap) => <div className="cap-row" key={cap.name}><span className="cap-id"><b>{cap.mark}</b><span><strong>{cap.name}</strong><small>{cap.detail}</small></span></span><span>{cap.scopes}</span><span className={cap.status === "Healthy" ? "health good" : "health warn"}><i />{cap.status}</span><button onClick={() => setToast(`${cap.name} settings opened`)}>•••</button></div>)}
-          </section>}
-
-          {view === "memory" && <section className="memory-layout">
-            <div className="memory-main">
-              <div className="memory-banner"><span className="shield large">✓</span><div><strong>You own this memory.</strong><p>Encrypted locally and synchronized as typed records. AI hosts receive only the fields you approve for that host and session.</p></div><button onClick={() => setToast("Memory export prepared")}>Export vault</button></div>
-              <div className="memory-section-title"><div><strong>Identity & preferences</strong><small>4 verified records</small></div><button onClick={() => setToast("New memory editor opened")}>＋ Add memory</button></div>
-              {[
-                ["PROFILE", "About me", "Founder and operator focused on building durable, high-leverage businesses.", "All connected AI"],
-                ["STYLE", "How I like to work", "Move quickly, verify deeply, communicate outcomes clearly, and avoid unnecessary friction.", "Coding AI only"],
-                ["PREFERENCE", "Communication", "Concise by default. Surface risks early. Ask only when the choice materially changes the outcome.", "All connected AI"],
-                ["CONTEXT", "Active product", "Building a portable capability and memory layer for moving seamlessly between AI platforms.", "Selected sessions"],
-              ].map((m)=><article className="memory-card" key={m[1]}><div><span>{m[0]}</span><strong>{m[1]}</strong></div><p>{m[2]}</p><footer><span><i/> {m[3]}</span><button onClick={()=>setToast(`${m[1]} permissions opened`)}>Manage access</button></footer></article>)}
-            </div>
-            <aside className="memory-policy"><p className="modal-eyebrow">DISCLOSURE POLICY</p><h2>Context without oversharing.</h2><p>Memory is evaluated at request time against the AI host, workspace, purpose, and sensitivity.</p><div className="policy-stat"><span>Default posture</span><b>Ask first</b></div><div className="policy-stat"><span>Sensitive records</span><b>Local only</b></div><div className="policy-stat"><span>Provenance required</span><b>Always</b></div><div className="policy-stat"><span>Automatic expiry</span><b>90 days</b></div><button onClick={()=>setToast("Disclosure policy opened")}>Edit disclosure policy →</button></aside>
-          </section>}
-
-          {view === "activity" && <section className="audit-panel">
-            <div className="audit-hero"><span className="shield large">✓</span><div><h2>Protected by Relay Vault</h2><p>Every configuration mutation is signed, logged, and reversible. Secrets never leave the encrypted broker.</p></div><span>ZERO CRITICAL EVENTS</span></div>
-            {[
-              ["Today, 7:42 PM", "Cursor synchronized", "relay-agent · macOS", "6 capabilities verified", "Success"],
-              ["Today, 6:56 PM", "Permission changed", "GitHub · pull_requests", "Read → Read & write", "Verified"],
-              ["Today, 4:11 PM", "Credential rotated", "Linear · OAuth 2.0", "Token replaced safely", "Success"],
-              ["Yesterday, 9:20 PM", "Link deployed", "Claude · Default Link", "v1.7 → v1.8", "Success"],
-            ].map((row) => <div className="audit-row" key={row[0] + row[1]}><time>{row[0]}</time><div><strong>{row[1]}</strong><small>{row[2]}</small></div><span>{row[3]}</span><b>✓ {row[4]}</b></div>)}
-          </section>}
-        </div>
-      </section>
-
-      {flow !== "closed" && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="Connect an AI host">
-        <button className="modal-backdrop" onClick={() => setFlow("closed")} aria-label="Close" />
-        <section className="modal">
-          <div className="modal-head"><div><span className="brand-mark small">R</span><div><strong>{flow === "done" ? "Connection complete" : "Connect an AI"}</strong><small>{flow === "host" ? "Choose where to deploy your Link" : `${selectedHost} · Default Link`}</small></div></div><button onClick={() => setFlow("closed")}>×</button></div>
-          <div className="step-line"><i className="active" /><i className={flow !== "host" ? "active" : ""} /><i className={["deploying", "done"].includes(flow) ? "active" : ""} /></div>
-
-          {flow === "host" && <div className="modal-body"><p className="modal-eyebrow">SELECT HOST</p><h2>Where should Relay connect?</h2><p className="modal-copy">We’ll detect the host’s supported features and generate a safe, native configuration.</p><div className="host-picker">{hosts.filter((h) => h.status !== "Connected").map((host) => <button key={host.name} className={selectedHost === host.name ? "selected" : ""} onClick={() => setSelectedHost(host.name)}><span className={`host-mark ${host.tone}`}>{host.mark}</span><div><strong>{host.name}</strong><small>{host.name === "Codex" ? "MCP · Skills · Plugins" : "MCP · Native tools"}</small></div><i>→</i></button>)}</div></div>}
-
-          {flow === "review" && <div className="modal-body review"><p className="modal-eyebrow">REVIEW ACCESS</p><h2>Everything stays in your control.</h2><p className="modal-copy">Choose exactly what {selectedHost} can access. Relay will never share raw credentials.</p><div className="review-list">{capabilities.map((cap) => <label key={cap.name}><span className="cap-id"><b>{cap.mark}</b><span><strong>{cap.name}</strong><small>{cap.scopes}</small></span></span><input type="checkbox" checked={selected.includes(cap.name)} onChange={() => toggleCapability(cap.name)} /><i /></label>)}</div><div className="vault-line"><span className="shield">✓</span><p><strong>Credentials protected by Relay Vault</strong><small>{selected.length} capabilities · Tokens remain encrypted</small></p></div></div>}
-
-          {flow === "deploying" && <div className="modal-body deploying"><div className="deploy-visual"><div className="deploy-ring"><span className="brand-mark">R</span></div><i className="scan-line" /></div><p className="modal-eyebrow">SECURELY DEPLOYING</p><h2>Connecting {selectedHost}</h2><p className="modal-copy">Generating native configuration, exchanging scoped tokens, and verifying {selected.length} capabilities.</p><div className="deploy-checks"><span>✓ Manifest signed</span><span>✓ Permissions verified</span><span className="pending">○ Running health checks</span></div></div>}
-
-          {flow === "done" && <div className="modal-body deploying"><div className="success-mark">✓</div><p className="modal-eyebrow">LINK ACTIVE</p><h2>{selectedHost} is ready.</h2><p className="modal-copy">Your Default Link is connected and all {selected.length} selected capabilities passed their health checks.</p><div className="connection-receipt"><span>Deployment receipt</span><b>RLY-{Date.now().toString().slice(-6)}</b><span>Rollback available</span><b>30 days</b></div></div>}
-
-          {!(["deploying", "done"] as string[]).includes(flow) && <div className="modal-footer"><button onClick={() => setFlow("closed")}>Cancel</button><button className="primary" onClick={() => flow === "host" ? setFlow("review") : deploy()}>{flow === "host" ? "Continue" : `Connect ${selectedHost}`} <span>→</span></button></div>}
-          {flow === "done" && <div className="modal-footer single"><button className="primary" onClick={() => { setFlow("closed"); setToast(`${selectedHost} connected successfully`); }}>Done</button></div>}
-        </section>
-      </div>}
-      {toast && <div className="toast"><span>✓</span>{toast}</div>}
-    </main>
-  );
+    {modal!=="closed"&&<div className="modal-layer" role="dialog" aria-modal="true"><button className="modal-backdrop" onClick={()=>setModal("closed")} aria-label="Close"/><section className="modal"><div className="modal-head"><div><span className="kord-mark small">K</span><div><strong>{modal==="import"?"Import complete":modal==="done"?"Connection complete":"Kord connection flow"}</strong><small>{target} · Default Kord Pack</small></div></div><button onClick={()=>setModal("closed")}>×</button></div><div className="step-line"><i className="active"/><i className={modal!=="host"?"active":""}/><i className={["deploy","done","import"].includes(modal)?"active":""}/></div>
+      {modal==="host"&&<div className="modal-body"><p className="modal-eyebrow">SELECT AI HOST</p><h2>Where should your Kord go?</h2><p className="modal-copy">Each host receives its own scoped deployment. Provider credentials stay behind Kord.</p><div className="host-picker">{hosts.filter(h=>h.status!=="Connected").map(h=><button className={target===h.name?"selected":""} key={h.name} onClick={()=>setTarget(h.name)}><Logo name={h.name} size="lg"/><div><strong>{h.name}</strong><small>{h.name==="Codex"?"MCP · Skills · Plugins":"MCP · Native capabilities"}</small></div><i>→</i></button>)}</div></div>}
+      {modal==="review"&&<div className="modal-body review"><p className="modal-eyebrow">REVIEW & CONTROL</p><h2>{hosts.find(h=>h.name===target)?.status==="Connected"?`${target} is connected.`:`Choose what ${target} can use.`}</h2><p className="modal-copy">Definitions are portable. OAuth grants are not. Kord keeps one provider authorization and issues a separate host-scoped session.</p><div className="review-list">{caps.map(c=><label key={c.name}><span className="cap-id"><Logo name={c.name}/><span><strong>{c.name}</strong><small>{c.scopes}</small></span></span><input type="checkbox" checked={selected.includes(c.name)} onChange={()=>setSelected(p=>p.includes(c.name)?p.filter(x=>x!==c.name):[...p,c.name])}/><i/></label>)}</div><div className="vault-line"><span className="shield">✓</span><p><strong>Credentials stay behind Kord</strong><small>{selected.length} definitions · one host-specific session</small></p></div></div>}
+      {modal==="deploy"&&<div className="modal-body deploying"><div className="deploy-visual"><div className="deploy-ring"><span className="kord-mark">K</span></div><i className="scan-line"/></div><p className="modal-eyebrow">VERIFYING DEPLOYMENT</p><h2>Connecting {target}</h2><p className="modal-copy">Rendering native configuration, applying scopes, and checking observed state.</p><div className="deploy-checks"><span>✓ Pack signed</span><span>✓ Policy applied</span><span className="pending">○ Adapter check</span></div></div>}
+      {modal==="done"&&<div className="modal-body deploying"><div className="success-mark">✓</div><p className="modal-eyebrow">KORD ACTIVE</p><h2>{target} is connected.</h2><p className="modal-copy">All selected definitions passed the simulated adapter verification. A production adapter would attach its signed evidence here.</p><div className="connection-receipt"><span>Receipt</span><b>KRD-{Date.now().toString().slice(-6)}</b><span>Rollback window</span><b>30 days</b></div></div>}
+      {modal==="import"&&report&&<div className="modal-body deploying"><div className="success-mark">✓</div><p className="modal-eyebrow">PORTABILITY VERIFIED</p><h2>Import complete.</h2><p className="modal-copy">Kord read <b>{report.source}</b> and normalized the portable content. Credentials were not imported.</p><div className="connection-receipt"><span>Connections found</span><b>{report.connections}</b><span>Memory records</span><b>{report.memories}</b></div></div>}
+      {modal==="host"&&<div className="modal-footer"><button onClick={()=>setModal("closed")}>Cancel</button><button className="primary" onClick={()=>setModal("review")}>Review access →</button></div>}
+      {modal==="review"&&<div className="modal-footer">{hosts.find(h=>h.name===target)?.status==="Connected"&&<button className="danger" onClick={revoke}>Cut the Kord</button>}<button onClick={()=>setModal("closed")}>Cancel</button><button className="primary" onClick={deploy}>{hosts.find(h=>h.name===target)?.status==="Connected"?"Update connection":"Connect securely"} →</button></div>}
+      {["done","import"].includes(modal)&&<div className="modal-footer single"><button className="primary" onClick={()=>setModal("closed")}>Done</button></div>}
+    </section></div>}
+    {toast&&<div className="toast"><span>✓</span>{toast}</div>}
+  </main>;
 }

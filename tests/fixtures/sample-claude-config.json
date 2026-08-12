@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "stripe-live": {
+      "type": "http",
+      "url": "https://example.invalid/mcp"
+    },
+    "custom-analytics": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  }
+}
