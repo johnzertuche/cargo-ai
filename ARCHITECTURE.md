@@ -18,7 +18,7 @@ An optional future sync service may store opaque ciphertext and signed update me
 ## Vault
 
 - A random 256-bit vault master key is created once and stored in the OS credential store.
-- Profile, connection, memory, deployment, and receipt documents are encrypted independently with XChaCha20-Poly1305.
+- Profile, connection, memory, deployment, provider-grant, revocation-operation, and receipt documents are encrypted independently with XChaCha20-Poly1305.
 - Every record uses a unique 192-bit nonce and authenticated data containing the table, record identifier, and envelope version.
 - SQLite WAL is enabled. Plaintext document fields from the earlier prototype schema are migrated to encrypted envelopes on open.
 - Secret values are never included in `ConnectionDefinition`; imports retain only required environment/header key names.
@@ -60,11 +60,17 @@ JSON mutation supports Claude Desktop local `mcpServers` and Cursor `mcpServers`
 
 ## Revocation states
 
-Host removal is only one stage. The complete model is:
+Host deployment and provider authorization are independent axes. Host removal remains:
 
-`active → local_blocked → host_removed → provider_pending → provider_revoked_unverified → verified`
+`active → local_blocked → host_removed`
 
-Failures remain `partial`, `conflict`, or `failed` with evidence. The current private preview implements verified host-fragment removal for JSON adapters. It does not label that outcome provider-revoked.
+Provider grants use:
+
+`active → locally_blocked → revocation_pending → provider_revoked_unverified → verified_revoked`
+
+Provider failures remain `partial` or `failed` with redacted evidence codes; host failures remain `conflict` or `failed`. Beginning provider revocation atomically persists the local block and durable pending operation before any network call. RFC 7009 acceptance is recorded only as accepted-but-unverified. Verification requires inactive introspection or equivalent rejection evidence, and access rejection alone cannot prove a refresh token is dead. These state and persistence invariants are implemented; live provider transport, token custody, and renderer commands remain gated.
+
+Remote MCP authorization follows the current MCP authorization model: protected-resource and authorization-server metadata must bind the exact HTTPS resource and issuer, PKCE S256 must be advertised, the resource is repeated in authorization and token requests, native callbacks use an IP-literal loopback URI with an ephemeral port, and state/code verifier values never enter serializable models. See [docs/OAUTH_SECURITY.md](docs/OAUTH_SECURITY.md).
 
 ## Memory
 

@@ -5,5 +5,5 @@
   "identifier":"ai.cargo.desktop",
   "build":{"beforeDevCommand":"npm run dev","devUrl":"http://127.0.0.1:1420","beforeBuildCommand":"npm run build","frontendDist":"../dist"},
   "app":{"security":{"csp":"default-src 'self'; img-src 'self' data:; style-src 'self'; connect-src ipc: http://ipc.localhost"},"windows":[{"title":"Cargo","width":1240,"height":800,"minWidth":560,"minHeight":620,"resizable":true,"fullscreen":false,"center":true}]},
-  "bundle":{"active":true,"targets":"all","category":"Utility","shortDescription":"Your AI connections and memory, owned by you.","longDescription":"An open-source, local-first encrypted vault for portable AI connections, MCP configuration, and memory.","macOS":{"signingIdentity":"-","hardenedRuntime":true,"minimumSystemVersion":"13.0"}}
+  "bundle":{"active":true,"targets":["app","dmg"],"category":"Utility","shortDescription":"Your AI connections and memory, owned by you.","longDescription":"An open-source, local-first encrypted vault for portable AI connections, MCP configuration, and memory.","macOS":{"hardenedRuntime":true,"minimumSystemVersion":"13.0"}}
 }

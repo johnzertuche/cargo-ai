@@ -36,6 +36,7 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 - Host registration removal cannot invalidate a provider credential copied outside Cargo.
 - An encrypted portable pack cannot be recovered if its passphrase is lost.
 - The current preview does not transfer live OAuth refresh tokens and does not claim provider-side revocation.
+- Provider-grant and revocation records now have encrypted schemas and tested state transitions, but no live provider transport is enabled in the released UI. This is security infrastructure, not a claim of provider compatibility.
 - The current receipt chain detects record modification and ordering breaks when read; a privileged attacker able to replace the entire database and keychain state is outside its protection.
 
 ## Required future credential flow
@@ -56,3 +57,5 @@ Offline/provider failures remain locally blocked and pending. The UI must not sa
 ## Release security
 
 Production release requires signed/notarized binaries, signed updates, pinned lockfiles, dependency/secret/license scanning, SBOM and provenance, malicious-import and crash-consistency testing, clean-device restore testing, real adapter conformance tests, and an independent audit with remediation.
+
+The production macOS workflow is deliberately fail-closed: missing Apple credentials, an unsigned/lightweight/mismatched tag, ad-hoc signing, failed notarization/stapling, Gatekeeper rejection, or a failed test/audit prevents publication. The existing preview artifacts remain explicitly ad-hoc signed and are not promoted by that workflow.

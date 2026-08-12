@@ -22,6 +22,10 @@
 # misc
 .DS_Store
 *.pem
+*.p12
+AuthKey_*.p8
+*.keychain-db
+tauri-updater-private.key
 
 # debug
 npm-debug.log*

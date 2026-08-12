@@ -17,6 +17,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 - Hash-chained local receipts with an explicit tail-truncation limitation
 - Shared Rust core used by the desktop app and CLI
 - Strict Tauri CSP and a small explicit command surface
+- Provider-neutral MCP/OAuth security core: HTTPS metadata validation, issuer/resource binding, PKCE S256, one-shot state, encrypted grant records, and durable honest revocation states (not yet connected to live providers)
 
 ## Explicit limits
 
@@ -29,7 +30,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 
 ## Desktop app
 
-The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.3) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
+The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.4) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
 
 Source prerequisites: macOS, Node.js 22+, and current stable Rust.
 
@@ -40,10 +41,10 @@ npm install
 npm run desktop:dev
 ```
 
-Create an unsigned local application bundle:
+Create an explicitly ad-hoc-signed local preview bundle:
 
 ```bash
-npm run desktop:build
+npm run desktop:build:preview
 ```
 
 The app calls account creation **Create local profile** because no vendor account is involved. The vault key is stored in macOS Keychain and the encrypted database remains in the normal per-user application-data directory.
@@ -75,7 +76,7 @@ cargo run -p cargo-ai-cli -- import-encrypted cargo-ai-portable-pack.age
 
 ## Repository layout
 
-- `crates/core` — encrypted vault, transfer format, discovery, transaction and removal engine
+- `crates/core` — encrypted vault, transfer format, discovery, transaction/removal engine, and provider-neutral OAuth lifecycle
 - `apps/desktop` — Tauri 2 desktop app
 - `apps/cli` — command-line interface using the same core
 - `app` — public website; it never reads the local vault
@@ -91,7 +92,9 @@ cd apps/desktop && npm run build
 cd ../.. && npm test
 ```
 
-The test suite includes encrypted-at-rest checks, wrong-key and wrong-passphrase rejection, malicious URL/symlink rejection, argument and URL secret redaction, bounded transactional import, stale-plan rejection, unrelated-field preservation, and drift-safe removal.
+The test suite includes encrypted-at-rest checks, wrong-key and wrong-passphrase rejection, malicious URL/symlink rejection, argument and URL secret redaction, bounded transactional import, stale-plan rejection, unrelated-field preservation, drift-safe removal, PKCE/resource binding, one-shot OAuth state, offline revocation persistence, and proof that revocation acceptance is not mislabeled as verification.
+
+The repository also contains a fail-closed production macOS workflow. It accepts only a GitHub-verified signed `vMAJOR.MINOR.PATCH` tag, requires Developer ID and App Store Connect credentials, notarizes and staples, runs Gatekeeper/signature/disk-image checks, emits CycloneDX SBOMs and SHA-256 checksums, creates GitHub provenance attestations, and publishes only after all gates pass. See [docs/PRODUCTION_RELEASE.md](docs/PRODUCTION_RELEASE.md).
 
 ## Release policy
 

@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "desktop:build:preview": "tauri build --config src-tauri/tauri.preview.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

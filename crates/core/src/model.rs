@@ -79,6 +79,119 @@ pub enum DeploymentState {
     Failed,
 }
 
+/// A provider authorization is independent from a host configuration deployment.
+/// Secret references are opaque identifiers; token values never belong in this model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGrant {
+    pub id: Uuid,
+    pub connection_id: Uuid,
+    pub resource: String,
+    pub issuer: String,
+    pub client_id: String,
+    pub registration_kind: ClientRegistrationKind,
+    pub scopes: Vec<String>,
+    pub access_expires_at: Option<DateTime<Utc>>,
+    pub access_secret_ref: String,
+    pub refresh_secret_ref: Option<String>,
+    pub status: GrantStatus,
+    pub current_revocation_id: Option<Uuid>,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub last_verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GrantActivationOperation {
+    pub id: Uuid,
+    pub grant_id: Uuid,
+    pub access_secret_ref: String,
+    pub refresh_secret_ref: Option<String>,
+    pub state: GrantActivationState,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantActivationState {
+    Staged,
+    CredentialsWritten,
+    Completed,
+    CleanupPending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientRegistrationKind {
+    PreconfiguredPublic,
+    ClientIdMetadataDocument,
+    DynamicPublic,
+    UserSuppliedPublic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantStatus {
+    Active,
+    ReauthRequired,
+    LocallyBlocked,
+    RevocationPending,
+    ProviderRevokedUnverified,
+    LocalCleanupPending,
+    VerifiedRevoked,
+    Partial,
+    Failed,
+}
+
+impl GrantStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::VerifiedRevoked)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationOperation {
+    pub id: Uuid,
+    pub grant_id: Uuid,
+    pub grant_revision: u64,
+    pub requested_at: DateTime<Utc>,
+    pub local_blocked_at: DateTime<Utc>,
+    pub access_result: TokenRevocationResult,
+    pub refresh_result: TokenRevocationResult,
+    pub verification: RevocationVerification,
+    pub attempts: u32,
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub last_safe_error: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenRevocationResult {
+    NotAttempted,
+    AcceptedUnverified,
+    Unsupported,
+    RetryableFailure,
+    PermanentFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationVerification {
+    NotAttempted,
+    AccessInactive,
+    RefreshInactive,
+    AllIssuedTokensInactive,
+    ProviderGrantRevoked,
+    ResourceRejected,
+    AccessRejectedRefreshUnverified,
+    StillActive,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PortablePack {

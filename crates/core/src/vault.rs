@@ -1,6 +1,8 @@
 use crate::{
-    AuditReceipt, ConnectionDefinition, DeploymentState, LocalProfile, ManagedDeployment,
-    MemoryRecord, PackImportResult, PortablePack,
+    AuditReceipt, ConnectionDefinition, DeploymentState, GrantActivationOperation,
+    GrantActivationState, LocalProfile, ManagedDeployment, MemoryRecord, PackImportResult,
+    PortablePack, ProviderGrant, RevocationOperation, RevocationVerification,
+    TokenRevocationResult,
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
@@ -21,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const KEYRING_SERVICE: &str = "ai.cargo.desktop";
 const ENVELOPE_VERSION: u8 = 1;
@@ -69,6 +71,7 @@ impl Vault {
         vault.migrate()?;
         vault.encrypt_legacy_rows()?;
         vault.harden_database_files()?;
+        vault.reconcile_grant_activations()?;
         Ok(vault)
     }
 
@@ -124,6 +127,9 @@ impl Vault {
           CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS provider_grants (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS grant_activations (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS revocations (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         "#,
         )?;
@@ -137,6 +143,9 @@ impl Vault {
             "memory",
             "receipts",
             "deployments",
+            "provider_grants",
+            "grant_activations",
+            "revocations",
         ] {
             let query = format!("SELECT id, document FROM {table} WHERE typeof(document)='text'");
             let mut statement = self.db.prepare(&query)?;
@@ -338,6 +347,15 @@ impl Vault {
         if is_managed {
             bail!("remove every active managed host deployment before deleting this connection");
         }
+        if self
+            .provider_grants()?
+            .iter()
+            .any(|grant| grant.connection_id == id && !grant.status.is_terminal())
+        {
+            bail!(
+                "verify or explicitly resolve every provider grant before deleting this connection"
+            );
+        }
         let transaction = self.db.unchecked_transaction()?;
         self.delete_row("connections", id)?;
         self.receipt(
@@ -394,6 +412,280 @@ impl Vault {
     }
     pub fn deployments(&self) -> Result<Vec<ManagedDeployment>> {
         self.all("deployments", true)
+    }
+
+    pub fn provider_grants(&self) -> Result<Vec<ProviderGrant>> {
+        self.all("provider_grants", true)
+    }
+
+    pub fn grant_activation_operations(&self) -> Result<Vec<GrantActivationOperation>> {
+        self.all("grant_activations", true)
+    }
+
+    pub fn provider_grant(&self, id: Uuid) -> Result<Option<ProviderGrant>> {
+        self.by_id("provider_grants", id)
+    }
+
+    pub fn revocation_operations(&self) -> Result<Vec<RevocationOperation>> {
+        self.all("revocations", true)
+    }
+
+    pub fn revocation_operation(&self, id: Uuid) -> Result<Option<RevocationOperation>> {
+        self.by_id("revocations", id)
+    }
+
+    pub fn save_provider_grant(&self, grant: &ProviderGrant) -> Result<()> {
+        crate::oauth::validate_provider_grant(grant)?;
+        if self.connection(grant.connection_id)?.is_none() {
+            bail!("provider grant references an unknown connection");
+        }
+        let existing = self.provider_grant(grant.id)?;
+        if grant.status == crate::GrantStatus::Active && existing.is_none() {
+            bail!("activate a new provider grant through the journaled credential-custody API");
+        }
+        if grant.status == crate::GrantStatus::Active {
+            self.verify_secret_value(&grant.access_secret_ref)?;
+            if let Some(reference) = &grant.refresh_secret_ref {
+                self.verify_secret_value(reference)?;
+            }
+        }
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("provider_grants", grant.id, grant)?;
+        self.receipt(
+            "provider_grant.saved",
+            &grant.id.to_string(),
+            "success",
+            &format!("{}:{:?}", grant.resource, grant.status),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commits token custody and active grant metadata as a compensating
+    /// transaction. Secret values are verified in Keychain before the encrypted
+    /// grant record becomes Active; DB failure removes both staged credentials.
+    pub fn activate_provider_grant(
+        &self,
+        grant: &ProviderGrant,
+        access_token: SecretString,
+        refresh_token: Option<SecretString>,
+    ) -> Result<()> {
+        if grant.status != crate::GrantStatus::Active {
+            bail!("newly activated provider grant must be Active");
+        }
+        if refresh_token.is_some() != grant.refresh_secret_ref.is_some() {
+            bail!("refresh token and refresh secret reference must agree");
+        }
+        crate::oauth::validate_provider_grant(grant)?;
+        if self.connection(grant.connection_id)?.is_none() {
+            bail!("provider grant references an unknown connection");
+        }
+        if self.provider_grant(grant.id)?.is_some() {
+            bail!("provider grant already exists");
+        }
+        let mut operation = GrantActivationOperation {
+            id: Uuid::new_v4(),
+            grant_id: grant.id,
+            access_secret_ref: grant.access_secret_ref.clone(),
+            refresh_secret_ref: grant.refresh_secret_ref.clone(),
+            state: GrantActivationState::Staged,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("grant_activations", operation.id, &operation)?;
+        self.receipt(
+            "provider_grant.activation_staged",
+            &operation.id.to_string(),
+            "success",
+            "credential-references-only",
+        )?;
+        transaction.commit()?;
+
+        if let Err(error) = self.put_secret_value(&grant.access_secret_ref, access_token) {
+            operation.state = GrantActivationState::CleanupPending;
+            self.put("grant_activations", operation.id, &operation)?;
+            self.reconcile_grant_activations()?;
+            return Err(error);
+        }
+        if let (Some(reference), Some(token)) = (grant.refresh_secret_ref.as_deref(), refresh_token)
+            && let Err(error) = self.put_secret_value(reference, token)
+        {
+            operation.state = GrantActivationState::CleanupPending;
+            self.put("grant_activations", operation.id, &operation)?;
+            self.reconcile_grant_activations()?;
+            return Err(error);
+        }
+        operation.state = GrantActivationState::CredentialsWritten;
+        self.put("grant_activations", operation.id, &operation)?;
+        let result = (|| {
+            let transaction = self.db.unchecked_transaction()?;
+            self.put("provider_grants", grant.id, grant)?;
+            operation.state = GrantActivationState::Completed;
+            operation.completed_at = Some(Utc::now());
+            self.put("grant_activations", operation.id, &operation)?;
+            self.receipt(
+                "provider_grant.activated",
+                &grant.id.to_string(),
+                "success",
+                &format!("{}:{:?}", grant.resource, grant.status),
+            )?;
+            transaction.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = result {
+            operation.state = GrantActivationState::CleanupPending;
+            let journal_result = self.put("grant_activations", operation.id, &operation);
+            let cleanup_result = self.reconcile_grant_activations();
+            if let Err(cleanup_error) = journal_result.and(cleanup_result) {
+                return Err(error.context(format!(
+                    "provider activation failed and credential cleanup remains pending: {cleanup_error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reconcile_grant_activations(&self) -> Result<()> {
+        for mut operation in self.grant_activation_operations()? {
+            if operation.state == GrantActivationState::Completed {
+                continue;
+            }
+            if self.provider_grant(operation.grant_id)?.is_some() {
+                bail!("incomplete activation journal conflicts with an active provider grant");
+            }
+            operation.state = GrantActivationState::CleanupPending;
+            self.put("grant_activations", operation.id, &operation)?;
+            self.delete_secret_value(&operation.access_secret_ref)?;
+            if let Some(reference) = &operation.refresh_secret_ref {
+                self.delete_secret_value(reference)?;
+            }
+            operation.state = GrantActivationState::Completed;
+            operation.completed_at = Some(Utc::now());
+            let transaction = self.db.unchecked_transaction()?;
+            self.put("grant_activations", operation.id, &operation)?;
+            self.receipt(
+                "provider_grant.activation_reconciled",
+                &operation.id.to_string(),
+                "success",
+                "orphaned-credential-references-deleted",
+            )?;
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Durably blocks local use before the caller performs any provider I/O.
+    pub fn begin_provider_revocation(&self, grant_id: Uuid) -> Result<RevocationOperation> {
+        let mut grant = self
+            .provider_grant(grant_id)?
+            .context("provider grant was not found")?;
+        let operation = crate::oauth::begin_revocation(&mut grant, Utc::now())?;
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("provider_grants", grant.id, &grant)?;
+        self.put("revocations", operation.id, &operation)?;
+        self.receipt(
+            "provider_revocation.local_blocked",
+            &operation.id.to_string(),
+            "success",
+            "local-token-leases-denied;provider-pending",
+        )?;
+        transaction.commit()?;
+        Ok(operation)
+    }
+
+    pub fn record_provider_revocation_attempt(
+        &self,
+        operation_id: Uuid,
+        access_result: TokenRevocationResult,
+        refresh_result: TokenRevocationResult,
+        next_retry_at: Option<chrono::DateTime<Utc>>,
+        safe_error_code: Option<&str>,
+    ) -> Result<ProviderGrant> {
+        let mut operation = self
+            .revocation_operation(operation_id)?
+            .context("revocation operation was not found")?;
+        let mut grant = self
+            .provider_grant(operation.grant_id)?
+            .context("provider grant was not found")?;
+        crate::oauth::record_provider_attempt(
+            &mut grant,
+            &mut operation,
+            access_result,
+            refresh_result,
+            next_retry_at,
+            safe_error_code,
+        )?;
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("provider_grants", grant.id, &grant)?;
+        self.put("revocations", operation.id, &operation)?;
+        self.receipt(
+            "provider_revocation.attempted",
+            &operation.id.to_string(),
+            "success",
+            &format!("attempt:{};status:{:?}", operation.attempts, grant.status),
+        )?;
+        transaction.commit()?;
+        Ok(grant)
+    }
+
+    pub fn record_provider_revocation_verification(
+        &self,
+        operation_id: Uuid,
+        verification: RevocationVerification,
+    ) -> Result<ProviderGrant> {
+        let mut operation = self
+            .revocation_operation(operation_id)?
+            .context("revocation operation was not found")?;
+        let mut grant = self
+            .provider_grant(operation.grant_id)?
+            .context("provider grant was not found")?;
+        crate::oauth::record_verification(&mut grant, &mut operation, verification, Utc::now())?;
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("provider_grants", grant.id, &grant)?;
+        self.put("revocations", operation.id, &operation)?;
+        self.receipt(
+            "provider_revocation.verified",
+            &operation.id.to_string(),
+            "success",
+            &format!(
+                "status:{:?};evidence:{:?}",
+                grant.status, operation.verification
+            ),
+        )?;
+        transaction.commit()?;
+        Ok(grant)
+    }
+
+    /// Finalizes a verified provider revocation only after both local credential
+    /// references have been idempotently removed from the OS credential store.
+    pub fn finalize_provider_revocation(&self, operation_id: Uuid) -> Result<ProviderGrant> {
+        let mut operation = self
+            .revocation_operation(operation_id)?
+            .context("revocation operation was not found")?;
+        let mut grant = self
+            .provider_grant(operation.grant_id)?
+            .context("provider grant was not found")?;
+        if grant.status != crate::GrantStatus::LocalCleanupPending {
+            bail!("provider revocation evidence is not complete");
+        }
+        self.delete_secret_value(&grant.access_secret_ref)?;
+        if let Some(reference) = &grant.refresh_secret_ref {
+            self.delete_secret_value(reference)?;
+        }
+        crate::oauth::confirm_local_cleanup(&mut grant, &mut operation, Utc::now())?;
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("provider_grants", grant.id, &grant)?;
+        self.put("revocations", operation.id, &operation)?;
+        self.receipt(
+            "provider_revocation.local_cleanup_complete",
+            &operation.id.to_string(),
+            "success",
+            "credential-references-deleted",
+        )?;
+        transaction.commit()?;
+        Ok(grant)
     }
 
     pub fn deployment(&self, id: Uuid) -> Result<Option<ManagedDeployment>> {
@@ -582,20 +874,30 @@ impl Vault {
         }
     }
 
-    pub fn store_secret(&self, label: &str, secret: SecretString) -> Result<()> {
+    fn put_secret_value(&self, label: &str, secret: SecretString) -> Result<()> {
         keyring::Entry::new(KEYRING_SERVICE, label)?.set_password(secret.expose_secret())?;
-        self.receipt("secret.stored", label, "success", "os-keychain-reference")?;
+        self.verify_secret_value(label)
+    }
+
+    fn verify_secret_value(&self, label: &str) -> Result<()> {
+        let mut secret = Zeroizing::new(
+            keyring::Entry::new(KEYRING_SERVICE, label)?
+                .get_password()
+                .context("provider credential is missing from the OS credential store")?,
+        );
+        if secret.is_empty() {
+            bail!("provider credential is empty");
+        }
+        secret.zeroize();
         Ok(())
     }
 
-    pub fn delete_secret(&self, label: &str) -> Result<()> {
+    fn delete_secret_value(&self, label: &str) -> Result<()> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, label)?;
         match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(e.into()),
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        self.receipt("secret.deleted", label, "success", "os-keychain-reference")?;
-        Ok(())
     }
 
     fn receipt(&self, action: &str, target: &str, outcome: &str, evidence: &str) -> Result<()> {
@@ -656,6 +958,9 @@ impl Vault {
             "memory",
             "receipts",
             "deployments",
+            "provider_grants",
+            "grant_activations",
+            "revocations",
         ] {
             let mut statement = self.db.prepare(&format!("SELECT document FROM {table}"))?;
             for value in statement.query_map([], |r| {
@@ -939,6 +1244,80 @@ mod tests {
         assert!(target.profile().unwrap().is_none());
         assert!(target.connections().unwrap().is_empty());
         assert!(target.memory().unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_revocation_is_encrypted_durable_and_honest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let key = [21; 32];
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote-tools".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.com/tools".into()),
+            environment_keys: vec![],
+            metadata: BTreeMap::new(),
+        };
+        let grant_id = Uuid::new_v4();
+        let grant = ProviderGrant {
+            id: grant_id,
+            connection_id: connection.id,
+            resource: "https://mcp.example.com/tools".into(),
+            issuer: "https://auth.example.com".into(),
+            client_id: "cargo-public-client".into(),
+            registration_kind: crate::ClientRegistrationKind::DynamicPublic,
+            scopes: vec!["tools.read".into()],
+            access_expires_at: None,
+            access_secret_ref: crate::oauth::new_secret_reference(grant_id, "access").unwrap(),
+            refresh_secret_ref: Some(
+                crate::oauth::new_secret_reference(grant_id, "refresh").unwrap(),
+            ),
+            status: crate::GrantStatus::ReauthRequired,
+            current_revocation_id: None,
+            revision: 0,
+            created_at: Utc::now(),
+            last_verified_at: None,
+        };
+        let operation_id;
+        {
+            let vault = Vault::open_with_key(&path, key).unwrap();
+            vault.create_profile("OAuth test").unwrap();
+            vault.upsert_connection(&connection).unwrap();
+            vault.save_provider_grant(&grant).unwrap();
+            assert!(vault.delete_connection(connection.id).is_err());
+            let operation = vault.begin_provider_revocation(grant.id).unwrap();
+            operation_id = operation.id;
+            let pending = vault
+                .record_provider_revocation_attempt(
+                    operation.id,
+                    TokenRevocationResult::RetryableFailure,
+                    TokenRevocationResult::NotAttempted,
+                    Some(Utc::now() + chrono::Duration::minutes(1)),
+                    Some("network_unavailable"),
+                )
+                .unwrap();
+            assert_eq!(pending.status, crate::GrantStatus::RevocationPending);
+            assert!(!vault.raw_documents_contain("cargo-public-client").unwrap());
+            assert!(
+                !serde_json::to_string(&vault.export_safe().unwrap())
+                    .unwrap()
+                    .contains("provider_grant")
+            );
+        }
+        let reopened = Vault::open_with_key(&path, key).unwrap();
+        let operation = reopened
+            .revocation_operation(operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.attempts, 1);
+        assert_eq!(
+            reopened.provider_grant(grant.id).unwrap().unwrap().status,
+            crate::GrantStatus::RevocationPending
+        );
+        assert!(reopened.verify_receipt_chain().unwrap());
     }
 
     #[cfg(unix)]
