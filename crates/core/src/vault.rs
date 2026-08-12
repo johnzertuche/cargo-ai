@@ -1,6 +1,8 @@
 use crate::{
-    AuditReceipt, ConnectionDefinition, DeploymentState, ExecutionCredentialRequirement,
-    ExecutionCredentialStatus, ExecutionGrant, ExecutionGrantStatus, GrantActivationOperation,
+    AuditReceipt, ConnectionDefinition, DeploymentState, ExecutionCredentialActivation,
+    ExecutionCredentialActivationKind, ExecutionCredentialActivationState,
+    ExecutionCredentialRequirement, ExecutionCredentialStatus, ExecutionCredentialWrite,
+    ExecutionGrant, ExecutionGrantStatus, ExecutionGrantView, GrantActivationOperation,
     GrantActivationState, LocalProfile, ManagedDeployment, MemoryRecord, PackImportResult,
     PortablePack, ProviderGrant, RevocationOperation, RevocationVerification,
     TokenRevocationResult, execution::ExecutionGrantPreview,
@@ -13,6 +15,7 @@ use chacha20poly1305::{
 };
 use chrono::Utc;
 use directories::ProjectDirs;
+use fs2::FileExt;
 #[cfg(test)]
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,7 +23,7 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -43,23 +46,13 @@ impl Vault {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = normalize_vault_path(path.as_ref())?;
         let key = Self::load_or_create_key(&path)?;
         Self::open_with_key(path, key)
     }
 
     pub fn open_with_key(path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        if path.exists() && fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            bail!("refusing a symlinked vault database");
-        }
-        if let Some(parent) = path.parent() {
-            let existed = parent.exists();
-            fs::create_dir_all(parent)?;
-            if !existed {
-                set_private_directory(parent)?;
-            }
-        }
+        let path = normalize_vault_path(path.as_ref())?;
         let db = Connection::open(&path)?;
         set_private_file(&path)?;
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -72,6 +65,7 @@ impl Vault {
         vault.migrate()?;
         vault.encrypt_legacy_rows()?;
         vault.harden_database_files()?;
+        vault.reconcile_execution_credential_activations()?;
         vault.reconcile_grant_activations()?;
         vault.reconcile_pending_provider_authorizations()?;
         Ok(vault)
@@ -121,6 +115,31 @@ impl Vault {
         Ok(())
     }
 
+    fn with_execution_credential_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let lock_path = self.path.with_file_name(format!(
+            "{}.execution-credentials.lock",
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("vault filename is not valid UTF-8")?
+        ));
+        let lock_file = open_private_lock_file(&lock_path)?;
+        lock_file.lock_exclusive()?;
+        validate_lock_file_identity(&lock_file, &lock_path)?;
+        let result = operation();
+        let identity = validate_lock_file_identity(&lock_file, &lock_path);
+        let unlock = FileExt::unlock(&lock_file);
+        match (result, identity, unlock) {
+            (Ok(value), Ok(()), Ok(())) => Ok(value),
+            (Err(error), _, _) => Err(error),
+            (Ok(_), Err(error), _) => Err(error),
+            (Ok(_), Ok(()), Err(error)) => Err(error.into()),
+        }
+    }
+
     fn migrate(&self) -> Result<()> {
         self.db.execute_batch(
             r#"
@@ -130,6 +149,7 @@ impl Vault {
           CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS execution_grants (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS execution_credential_activations (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS execution_grant_owners (
             owner_key TEXT PRIMARY KEY,
             grant_id TEXT NOT NULL UNIQUE,
@@ -167,6 +187,7 @@ impl Vault {
             "receipts",
             "deployments",
             "execution_grants",
+            "execution_credential_activations",
             "provider_grants",
             "grant_activations",
             "revocations",
@@ -563,6 +584,7 @@ impl Vault {
                         binding_id: Uuid::new_v4(),
                         name: name.clone(),
                         status: ExecutionCredentialStatus::Missing,
+                        secret_ref: None,
                     })
                     .collect(),
                 status: ExecutionGrantStatus::AwaitingCredentials,
@@ -592,19 +614,487 @@ impl Vault {
         }
     }
 
-    pub fn execution_grant(&self, id: Uuid) -> Result<Option<ExecutionGrant>> {
+    pub(crate) fn execution_grant(&self, id: Uuid) -> Result<Option<ExecutionGrant>> {
         let grant: Option<ExecutionGrant> = self.by_id("execution_grants", id)?;
         grant
             .map(|grant| self.validate_execution_grant_owner(grant))
             .transpose()
     }
 
-    pub fn execution_grants(&self) -> Result<Vec<ExecutionGrant>> {
+    pub fn execution_grant_view(&self, id: Uuid) -> Result<Option<ExecutionGrantView>> {
+        Ok(self
+            .execution_grant(id)?
+            .as_ref()
+            .map(ExecutionGrantView::from))
+    }
+
+    pub fn execution_grant_views(&self) -> Result<Vec<ExecutionGrantView>> {
+        Ok(self
+            .execution_grants()?
+            .iter()
+            .map(ExecutionGrantView::from)
+            .collect())
+    }
+
+    pub(crate) fn execution_grants(&self) -> Result<Vec<ExecutionGrant>> {
         self.validate_execution_owner_index()?;
         self.all::<ExecutionGrant>("execution_grants", true)?
             .into_iter()
             .map(|grant| self.validate_execution_grant_owner(grant))
             .collect()
+    }
+
+    fn execution_credential_activations(&self) -> Result<Vec<ExecutionCredentialActivation>> {
+        self.all::<ExecutionCredentialActivation>("execution_credential_activations", true)?
+            .into_iter()
+            .map(|activation| {
+                crate::execution::validate_credential_activation(&activation)?;
+                Ok(activation)
+            })
+            .collect()
+    }
+
+    /// Journals and stores environment credentials without exposing them to a
+    /// host configuration or creating executable authority. Values must come
+    /// from a trusted native caller; they are never returned from this method.
+    pub fn store_execution_credentials(
+        &self,
+        grant_id: Uuid,
+        expected_revision: u64,
+        values: Vec<(String, SecretString)>,
+    ) -> Result<ExecutionGrantView> {
+        let mut provided: std::collections::HashMap<String, SecretString> =
+            std::collections::HashMap::new();
+        for (name, value) in values {
+            if provided.insert(name, value).is_some() {
+                bail!("credential input contains a duplicate environment name");
+            }
+        }
+        self.with_execution_credential_lock(|| {
+            self.store_execution_credentials_locked(grant_id, expected_revision, provided)
+        })
+    }
+
+    fn store_execution_credentials_locked(
+        &self,
+        grant_id: Uuid,
+        expected_revision: u64,
+        mut provided: std::collections::HashMap<String, SecretString>,
+    ) -> Result<ExecutionGrantView> {
+        let supplied_count = provided.len();
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let staged = (|| {
+            let grant: ExecutionGrant = self
+                .by_id("execution_grants", grant_id)?
+                .context("execution grant was not found")?;
+            let grant = self.validate_execution_grant_owner(grant)?;
+            if grant.status != ExecutionGrantStatus::AwaitingCredentials
+                || grant.revision != expected_revision
+            {
+                bail!("execution grant changed after credential review");
+            }
+            if self
+                .execution_credential_activations()?
+                .iter()
+                .any(|activation| {
+                    activation.grant_id == grant.id
+                        && activation.state != ExecutionCredentialActivationState::Completed
+                })
+            {
+                bail!("execution credential custody is already pending");
+            }
+            if supplied_count != grant.required_credentials.len()
+                || grant
+                    .required_credentials
+                    .iter()
+                    .any(|requirement| !provided.contains_key(&requirement.name))
+            {
+                bail!("credential values must exactly match the reviewed environment names");
+            }
+            let activation = ExecutionCredentialActivation {
+                id: Uuid::new_v4(),
+                grant_id: grant.id,
+                grant_revision: grant.revision,
+                kind: ExecutionCredentialActivationKind::Write,
+                credentials: grant
+                    .required_credentials
+                    .iter()
+                    .map(|requirement| ExecutionCredentialWrite {
+                        binding_id: requirement.binding_id,
+                        name: requirement.name.clone(),
+                        secret_ref: crate::execution::new_secret_reference(
+                            grant.id,
+                            requirement.binding_id,
+                        ),
+                    })
+                    .collect(),
+                state: ExecutionCredentialActivationState::Staged,
+                created_at: Utc::now(),
+                completed_at: None,
+            };
+            crate::execution::validate_credential_activation(&activation)?;
+            self.put(
+                "execution_credential_activations",
+                activation.id,
+                &activation,
+            )?;
+            self.receipt(
+                "execution_credentials.write_started",
+                &activation.id.to_string(),
+                "staged",
+                &format!(
+                    "grant:{};revision:{};count:{}",
+                    grant.id,
+                    grant.revision,
+                    activation.credentials.len()
+                ),
+            )?;
+            Ok::<ExecutionCredentialActivation, anyhow::Error>(activation)
+        })();
+        let mut activation = match staged {
+            Ok(activation) => {
+                self.db.execute_batch("COMMIT")?;
+                activation
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+
+        // Hold the cross-process writer lock for the entire external
+        // Keychain write and final encrypted grant transition. A second Cargo
+        // process therefore cannot misclassify this live Staged operation as
+        // abandoned crash residue.
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+
+        for credential in &activation.credentials {
+            let value = provided
+                .remove(&credential.name)
+                .context("reviewed credential value was not supplied")?;
+            if let Err(error) = self
+                .put_secret_value(&credential.secret_ref, &value)
+                .and_then(|()| self.verify_secret_value(&credential.secret_ref))
+            {
+                activation.state = ExecutionCredentialActivationState::CleanupPending;
+                let _ = self.put(
+                    "execution_credential_activations",
+                    activation.id,
+                    &activation,
+                );
+                let cleanup = self.cleanup_execution_credential_activation_locked(&mut activation);
+                let _ = self.db.execute_batch(if cleanup.is_ok() {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                });
+                return match cleanup {
+                    Ok(()) => Err(error.context(
+                        "execution credential storage failed; staged values were cleaned up",
+                    )),
+                    Err(cleanup_error) => Err(error.context(format!(
+                        "execution credential storage failed and cleanup remains pending: {cleanup_error}"
+                    ))),
+                };
+            }
+        }
+
+        activation.state = ExecutionCredentialActivationState::CredentialsWritten;
+        let finalized = (|| {
+            self.put(
+                "execution_credential_activations",
+                activation.id,
+                &activation,
+            )?;
+            self.receipt(
+                "execution_credentials.written",
+                &activation.id.to_string(),
+                "verified",
+                &format!("count:{}", activation.credentials.len()),
+            )?;
+            self.finalize_execution_credential_activation_locked(&mut activation)
+        })();
+        match finalized {
+            Ok(grant) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(ExecutionGrantView::from(&grant))
+            }
+            Err(error) => {
+                activation.state = ExecutionCredentialActivationState::CleanupPending;
+                let _ = self.put(
+                    "execution_credential_activations",
+                    activation.id,
+                    &activation,
+                );
+                let cleanup = self.cleanup_execution_credential_activation_locked(&mut activation);
+                let _ = self.db.execute_batch(if cleanup.is_ok() {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                });
+                match cleanup {
+                    Ok(()) => Err(error.context(
+                        "credential activation could not finalize; staged values were reconciled",
+                    )),
+                    Err(cleanup_error) => Err(error.context(format!(
+                        "credential activation could not finalize and reconciliation remains pending: {cleanup_error}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn finalize_execution_credential_activation_locked(
+        &self,
+        activation: &mut ExecutionCredentialActivation,
+    ) -> Result<ExecutionGrant> {
+        crate::execution::validate_credential_activation(activation)?;
+        if activation.kind != ExecutionCredentialActivationKind::Write
+            || activation.state != ExecutionCredentialActivationState::CredentialsWritten
+        {
+            bail!("execution credential activation is not ready to finalize");
+        }
+        let grant: ExecutionGrant = self
+            .by_id("execution_grants", activation.grant_id)?
+            .context("execution grant was not found")?;
+        let mut grant = self.validate_execution_grant_owner(grant)?;
+        if grant.status != ExecutionGrantStatus::AwaitingCredentials
+            || grant.revision != activation.grant_revision
+            || grant.required_credentials.len() != activation.credentials.len()
+        {
+            bail!("execution grant changed during credential custody");
+        }
+        for write in &activation.credentials {
+            self.verify_secret_value(&write.secret_ref)?;
+            let requirement = grant
+                .required_credentials
+                .iter_mut()
+                .find(|item| item.binding_id == write.binding_id && item.name == write.name)
+                .context("credential activation no longer matches its reviewed binding")?;
+            requirement.status = ExecutionCredentialStatus::Stored;
+            requirement.secret_ref = Some(write.secret_ref.clone());
+        }
+        grant.status = ExecutionGrantStatus::CredentialsReady;
+        grant.revision += 1;
+        crate::execution::validate_execution_grant(&grant)?;
+        activation.state = ExecutionCredentialActivationState::Completed;
+        activation.completed_at = Some(Utc::now());
+        crate::execution::validate_credential_activation(activation)?;
+        self.put("execution_grants", grant.id, &grant)?;
+        self.put(
+            "execution_credential_activations",
+            activation.id,
+            activation,
+        )?;
+        self.receipt(
+            "execution_credentials.ready",
+            &grant.id.to_string(),
+            "verified",
+            &format!(
+                "revision:{};count:{}",
+                grant.revision,
+                activation.credentials.len()
+            ),
+        )?;
+        Ok(grant)
+    }
+
+    fn reconcile_execution_credential_activations(&self) -> Result<()> {
+        self.with_execution_credential_lock(|| {
+            self.reconcile_execution_credential_activations_locked()
+        })
+    }
+
+    fn reconcile_execution_credential_activations_locked(&self) -> Result<()> {
+        let activation_ids = self
+            .execution_credential_activations()?
+            .into_iter()
+            .filter(|activation| activation.state != ExecutionCredentialActivationState::Completed)
+            .map(|activation| activation.id)
+            .collect::<Vec<_>>();
+        for activation_id in activation_ids {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let mut activation: ExecutionCredentialActivation = self
+                    .by_id("execution_credential_activations", activation_id)?
+                    .context("execution credential activation was not found")?;
+                crate::execution::validate_credential_activation(&activation)?;
+                if activation.state == ExecutionCredentialActivationState::Completed {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                if activation.kind == ExecutionCredentialActivationKind::Write
+                    && activation.state == ExecutionCredentialActivationState::CredentialsWritten
+                    && activation
+                        .credentials
+                        .iter()
+                        .all(|item| self.verify_secret_value(&item.secret_ref).is_ok())
+                {
+                    let _ =
+                        self.finalize_execution_credential_activation_locked(&mut activation)?;
+                    return Ok(());
+                }
+                activation.state = ExecutionCredentialActivationState::CleanupPending;
+                self.put(
+                    "execution_credential_activations",
+                    activation.id,
+                    &activation,
+                )?;
+                self.cleanup_execution_credential_activation_locked(&mut activation)
+            })();
+            match result {
+                Ok(()) => self.db.execute_batch("COMMIT")?,
+                Err(error) => {
+                    let _ = self.db.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_execution_credential_activation_locked(
+        &self,
+        activation: &mut ExecutionCredentialActivation,
+    ) -> Result<()> {
+        crate::execution::validate_credential_activation(activation)?;
+        if activation.state != ExecutionCredentialActivationState::CleanupPending {
+            bail!("execution credential activation is not ready for cleanup");
+        }
+        for credential in &activation.credentials {
+            self.delete_secret_value(&credential.secret_ref)?;
+        }
+        if activation.kind == ExecutionCredentialActivationKind::Delete {
+            let grant: ExecutionGrant = self
+                .by_id("execution_grants", activation.grant_id)?
+                .context("execution grant was not found")?;
+            let mut grant = self.validate_execution_grant_owner(grant)?;
+            if grant.status != ExecutionGrantStatus::CredentialsReady
+                || grant.revision != activation.grant_revision
+            {
+                bail!("execution grant changed during credential deletion");
+            }
+            for write in &activation.credentials {
+                let requirement = grant
+                    .required_credentials
+                    .iter_mut()
+                    .find(|item| {
+                        item.binding_id == write.binding_id
+                            && item.name == write.name
+                            && item.secret_ref.as_deref() == Some(write.secret_ref.as_str())
+                    })
+                    .context("credential deletion no longer matches its binding")?;
+                requirement.status = ExecutionCredentialStatus::Missing;
+                requirement.secret_ref = None;
+            }
+            grant.status = ExecutionGrantStatus::AwaitingCredentials;
+            grant.revision += 1;
+            crate::execution::validate_execution_grant(&grant)?;
+            self.put("execution_grants", grant.id, &grant)?;
+        }
+        activation.state = ExecutionCredentialActivationState::Completed;
+        activation.completed_at = Some(Utc::now());
+        crate::execution::validate_credential_activation(activation)?;
+        self.put(
+            "execution_credential_activations",
+            activation.id,
+            activation,
+        )?;
+        self.receipt(
+            "execution_credentials.cleaned",
+            &activation.id.to_string(),
+            "verified",
+            "credential-references-deleted",
+        )?;
+        Ok(())
+    }
+
+    /// Deletes every locally stored environment credential and returns the
+    /// immutable grant to an inert missing-credentials state.
+    pub fn forget_execution_credentials(
+        &self,
+        grant_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<ExecutionGrantView> {
+        self.with_execution_credential_lock(|| {
+            self.forget_execution_credentials_locked(grant_id, expected_revision)
+        })
+    }
+
+    fn forget_execution_credentials_locked(
+        &self,
+        grant_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<ExecutionGrantView> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let staged = (|| {
+            let grant: ExecutionGrant = self
+                .by_id("execution_grants", grant_id)?
+                .context("execution grant was not found")?;
+            let grant = self.validate_execution_grant_owner(grant)?;
+            if grant.status != ExecutionGrantStatus::CredentialsReady
+                || grant.revision != expected_revision
+            {
+                bail!("execution grant changed after credential cleanup review");
+            }
+            if self
+                .execution_credential_activations()?
+                .iter()
+                .any(|activation| {
+                    activation.grant_id == grant.id
+                        && activation.state != ExecutionCredentialActivationState::Completed
+                })
+            {
+                bail!("execution credential lifecycle is already pending");
+            }
+            let activation = ExecutionCredentialActivation {
+                id: Uuid::new_v4(),
+                grant_id: grant.id,
+                grant_revision: grant.revision,
+                kind: ExecutionCredentialActivationKind::Delete,
+                credentials: grant
+                    .required_credentials
+                    .iter()
+                    .map(|requirement| {
+                        Ok(ExecutionCredentialWrite {
+                            binding_id: requirement.binding_id,
+                            name: requirement.name.clone(),
+                            secret_ref: requirement
+                                .secret_ref
+                                .clone()
+                                .context("stored credential reference was missing")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                state: ExecutionCredentialActivationState::CleanupPending,
+                created_at: Utc::now(),
+                completed_at: None,
+            };
+            crate::execution::validate_credential_activation(&activation)?;
+            self.put(
+                "execution_credential_activations",
+                activation.id,
+                &activation,
+            )?;
+            self.receipt(
+                "execution_credentials.delete_started",
+                &activation.id.to_string(),
+                "blocked",
+                &format!("grant:{};revision:{}", grant.id, grant.revision),
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match staged {
+            Ok(()) => self.db.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        self.reconcile_execution_credential_activations_locked()?;
+        let grant = self
+            .execution_grant(grant_id)?
+            .context("execution grant was not found after credential cleanup")?;
+        Ok(ExecutionGrantView::from(&grant))
     }
 
     /// Cancels only an inert, credential-free grant using revision compare and
@@ -620,6 +1110,16 @@ impl Vault {
                 .by_id("execution_grants", grant_id)?
                 .context("execution grant was not found")?;
             grant = self.validate_execution_grant_owner(grant)?;
+            if self
+                .execution_credential_activations()?
+                .iter()
+                .any(|activation| {
+                    activation.grant_id == grant.id
+                        && activation.state != ExecutionCredentialActivationState::Completed
+                })
+            {
+                bail!("execution credential custody must finish before cancellation");
+            }
             if grant.status != ExecutionGrantStatus::AwaitingCredentials
                 || grant.revision != expected_revision
             {
@@ -661,19 +1161,21 @@ impl Vault {
     fn validate_execution_grant_owner(&self, grant: ExecutionGrant) -> Result<ExecutionGrant> {
         crate::execution::validate_execution_grant(&grant)?;
         let owner_key = crate::execution::owner_key(grant.connection_id, &grant.host);
-        let owner: Option<String> = self
+        let owner: Option<(String, String)> = self
             .db
             .query_row(
-                "SELECT grant_id FROM execution_grant_owners WHERE owner_key=?1",
+                "SELECT grant_id,connection_id FROM execution_grant_owners WHERE owner_key=?1",
                 params![owner_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let grant_id = grant.id.to_string();
+        let connection_id = grant.connection_id.to_string();
         match grant.status {
-            ExecutionGrantStatus::AwaitingCredentials
-                if owner.as_deref() == Some(grant_id.as_str()) => {}
-            ExecutionGrantStatus::Cancelled if owner.as_deref() != Some(grant_id.as_str()) => {}
+            ExecutionGrantStatus::AwaitingCredentials | ExecutionGrantStatus::CredentialsReady
+                if owner.as_ref() == Some(&(grant_id.clone(), connection_id.clone())) => {}
+            ExecutionGrantStatus::Cancelled
+                if owner.as_ref() != Some(&(grant_id, connection_id)) => {}
             _ => bail!("execution grant ownership is corrupt or inconsistent"),
         }
         Ok(grant)
@@ -696,8 +1198,10 @@ impl Vault {
                 .by_id("execution_grants", grant_id)?
                 .context("execution owner references a missing encrypted grant")?;
             crate::execution::validate_execution_grant(&grant)?;
-            if grant.status != ExecutionGrantStatus::AwaitingCredentials
-                || grant.connection_id != connection_id
+            if !matches!(
+                grant.status,
+                ExecutionGrantStatus::AwaitingCredentials | ExecutionGrantStatus::CredentialsReady
+            ) || grant.connection_id != connection_id
                 || owner_key != crate::execution::owner_key(connection_id, &grant.host)
             {
                 bail!("execution owner index is corrupt or inconsistent");
@@ -1759,6 +2263,7 @@ impl Vault {
             "receipts",
             "deployments",
             "execution_grants",
+            "execution_credential_activations",
             "provider_grants",
             "grant_activations",
             "revocations",
@@ -1831,6 +2336,141 @@ pub fn validate_portable_pack(pack: &PortablePack) -> Result<PortablePack> {
     validated.profile.display_name = validated.profile.display_name.trim().into();
     validated.connections = connections;
     Ok(validated)
+}
+
+fn normalize_vault_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let file_name = absolute
+        .file_name()
+        .context("vault path must include a filename")?
+        .to_os_string();
+    let parent = absolute.parent().context("vault path has no parent")?;
+    let existed = parent.exists();
+    fs::create_dir_all(parent)?;
+    if !existed {
+        set_private_directory(parent)?;
+    }
+    let parent = fs::canonicalize(parent)?;
+    validate_private_vault_parent(&parent)?;
+    let normalized = parent.join(file_name);
+    if normalized.exists() {
+        let metadata = fs::symlink_metadata(&normalized)?;
+        if metadata.file_type().is_symlink() {
+            bail!("refusing a symlinked vault database");
+        }
+        if !metadata.is_file() {
+            bail!("vault database path is not a regular file");
+        }
+        validate_existing_vault_file(&metadata)?;
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn validate_existing_vault_file(metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("vault database must be private, current-user-owned, and have one filesystem link");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_existing_vault_file(_metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_vault_parent(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        bail!("vault parent directory must be private and owned by the current user");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_vault_parent(path: &Path) -> Result<()> {
+    if !fs::metadata(path)?.is_dir() {
+        bail!("vault parent path is not a directory");
+    }
+    Ok(())
+}
+
+fn open_private_lock_file(path: &Path) -> Result<File> {
+    let parent = path.parent().context("credential lock has no parent")?;
+    validate_private_vault_parent(parent)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    set_private_file_handle(&file)?;
+    validate_lock_file_identity(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn set_private_file_handle(file: &File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_handle(_file: &File) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_lock_file_identity(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let handle = file.metadata()?;
+    let linked = fs::symlink_metadata(path)?;
+    if !handle.is_file()
+        || linked.file_type().is_symlink()
+        || !linked.is_file()
+        || handle.uid() != unsafe { libc::geteuid() }
+        || handle.nlink() != 1
+        || handle.permissions().mode() & 0o077 != 0
+        || handle.dev() != linked.dev()
+        || handle.ino() != linked.ino()
+    {
+        bail!("execution credential lock identity is unsafe or changed");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_lock_file_identity(file: &File, path: &Path) -> Result<()> {
+    let handle = file.metadata()?;
+    let linked = fs::symlink_metadata(path)?;
+    if !handle.is_file() || linked.file_type().is_symlink() || !linked.is_file() {
+        bail!("execution credential lock identity is unsafe or changed");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2874,6 +3514,441 @@ mod tests {
             })
             .unwrap();
         assert_eq!((consumed, owners), (0, 0));
+    }
+
+    #[test]
+    fn execution_credentials_are_keychain_only_and_forgettable() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [57_u8; 32]).unwrap();
+        vault.create_profile("Credential custody").unwrap();
+        let connection = environment_backed_stdio("credential-tools");
+        vault.upsert_connection(&connection).unwrap();
+        let preview = vault
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        let grant = vault.reserve_execution_grant(preview).unwrap();
+        let sentinel = format!("cargo-test-secret-{}", Uuid::new_v4());
+        let ready = vault
+            .store_execution_credentials(
+                grant.id,
+                0,
+                vec![(
+                    "EXAMPLE_API_KEY".into(),
+                    SecretString::from(sentinel.clone()),
+                )],
+            )
+            .unwrap();
+        assert_eq!(ready.status, ExecutionGrantStatus::CredentialsReady);
+        assert_eq!(ready.revision, 1);
+        assert_eq!(
+            ready.required_credentials[0].status,
+            ExecutionCredentialStatus::Stored
+        );
+        let reference = vault
+            .execution_grant(ready.id)
+            .unwrap()
+            .unwrap()
+            .required_credentials[0]
+            .secret_ref
+            .clone()
+            .unwrap();
+        assert!(vault.secret_value_exists(&reference).unwrap());
+        assert!(!vault.raw_documents_contain(&sentinel).unwrap());
+        assert!(
+            !serde_json::to_string(&vault.export_safe().unwrap())
+                .unwrap()
+                .contains(&sentinel)
+        );
+
+        let missing = vault.forget_execution_credentials(ready.id, 1).unwrap();
+        assert_eq!(missing.status, ExecutionGrantStatus::AwaitingCredentials);
+        assert_eq!(missing.revision, 2);
+        assert_eq!(
+            missing.required_credentials[0].status,
+            ExecutionCredentialStatus::Missing
+        );
+        assert!(
+            vault
+                .execution_grant(missing.id)
+                .unwrap()
+                .unwrap()
+                .required_credentials[0]
+                .secret_ref
+                .is_none()
+        );
+        assert!(!vault.secret_value_exists(&reference).unwrap());
+        vault.cancel_execution_grant(missing.id, 2).unwrap();
+    }
+
+    #[test]
+    fn incomplete_execution_credential_write_is_cleaned_on_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let key = [58_u8; 32];
+        let (grant_id, secret_ref) = {
+            let vault = Vault::open_with_key(&path, key).unwrap();
+            vault.create_profile("Credential recovery").unwrap();
+            let connection = environment_backed_stdio("recovery-tools");
+            vault.upsert_connection(&connection).unwrap();
+            let grant = vault
+                .reserve_execution_grant(
+                    vault
+                        .prepare_execution_grant(connection.id, "Cursor")
+                        .unwrap(),
+                )
+                .unwrap();
+            let requirement = &grant.required_credentials[0];
+            let secret_ref =
+                crate::execution::new_secret_reference(grant.id, requirement.binding_id);
+            let activation = ExecutionCredentialActivation {
+                id: Uuid::new_v4(),
+                grant_id: grant.id,
+                grant_revision: grant.revision,
+                kind: ExecutionCredentialActivationKind::Write,
+                credentials: vec![ExecutionCredentialWrite {
+                    binding_id: requirement.binding_id,
+                    name: requirement.name.clone(),
+                    secret_ref: secret_ref.clone(),
+                }],
+                state: ExecutionCredentialActivationState::Staged,
+                created_at: Utc::now(),
+                completed_at: None,
+            };
+            vault
+                .put(
+                    "execution_credential_activations",
+                    activation.id,
+                    &activation,
+                )
+                .unwrap();
+            vault
+                .put_secret_value(
+                    &secret_ref,
+                    &SecretString::from(format!("ambiguous-{}", Uuid::new_v4())),
+                )
+                .unwrap();
+            (grant.id, secret_ref)
+        };
+        let reopened = Vault::open_with_key(&path, key).unwrap();
+        assert!(!reopened.secret_value_exists(&secret_ref).unwrap());
+        let grant = reopened.execution_grant(grant_id).unwrap().unwrap();
+        assert_eq!(grant.status, ExecutionGrantStatus::AwaitingCredentials);
+        assert!(
+            reopened
+                .execution_credential_activations()
+                .unwrap()
+                .iter()
+                .all(|item| item.state == ExecutionCredentialActivationState::Completed)
+        );
+        reopened.cancel_execution_grant(grant.id, 0).unwrap();
+    }
+
+    #[test]
+    fn verified_execution_credentials_finalize_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let key = [59_u8; 32];
+        let (grant_id, secret_ref) = {
+            let vault = Vault::open_with_key(&path, key).unwrap();
+            vault
+                .create_profile("Credential finalize recovery")
+                .unwrap();
+            let connection = environment_backed_stdio("finalize-tools");
+            vault.upsert_connection(&connection).unwrap();
+            let grant = vault
+                .reserve_execution_grant(
+                    vault
+                        .prepare_execution_grant(connection.id, "Cursor")
+                        .unwrap(),
+                )
+                .unwrap();
+            let requirement = &grant.required_credentials[0];
+            let secret_ref =
+                crate::execution::new_secret_reference(grant.id, requirement.binding_id);
+            let activation = ExecutionCredentialActivation {
+                id: Uuid::new_v4(),
+                grant_id: grant.id,
+                grant_revision: grant.revision,
+                kind: ExecutionCredentialActivationKind::Write,
+                credentials: vec![ExecutionCredentialWrite {
+                    binding_id: requirement.binding_id,
+                    name: requirement.name.clone(),
+                    secret_ref: secret_ref.clone(),
+                }],
+                state: ExecutionCredentialActivationState::CredentialsWritten,
+                created_at: Utc::now(),
+                completed_at: None,
+            };
+            vault
+                .put(
+                    "execution_credential_activations",
+                    activation.id,
+                    &activation,
+                )
+                .unwrap();
+            vault
+                .put_secret_value(
+                    &secret_ref,
+                    &SecretString::from(format!("verified-{}", Uuid::new_v4())),
+                )
+                .unwrap();
+            vault.verify_secret_value(&secret_ref).unwrap();
+            (grant.id, secret_ref)
+        };
+        let reopened = Vault::open_with_key(&path, key).unwrap();
+        let ready = reopened.execution_grant(grant_id).unwrap().unwrap();
+        assert_eq!(ready.status, ExecutionGrantStatus::CredentialsReady);
+        assert_eq!(ready.revision, 1);
+        assert_eq!(
+            reopened
+                .execution_grant(ready.id)
+                .unwrap()
+                .unwrap()
+                .required_credentials[0]
+                .secret_ref
+                .as_deref(),
+            Some(secret_ref.as_str())
+        );
+        assert!(reopened.secret_value_exists(&secret_ref).unwrap());
+        let missing = reopened.forget_execution_credentials(ready.id, 1).unwrap();
+        assert_eq!(missing.status, ExecutionGrantStatus::AwaitingCredentials);
+        assert!(!reopened.secret_value_exists(&secret_ref).unwrap());
+        reopened.cancel_execution_grant(missing.id, 2).unwrap();
+    }
+
+    #[test]
+    fn duplicate_execution_credential_input_is_rejected_before_custody() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [60_u8; 32]).unwrap();
+        vault.create_profile("Duplicate credentials").unwrap();
+        let mut connection = environment_backed_stdio("duplicate-tools");
+        connection.environment_keys = vec!["FIRST_KEY".into(), "SECOND_KEY".into()];
+        vault.upsert_connection(&connection).unwrap();
+        let grant = vault
+            .reserve_execution_grant(
+                vault
+                    .prepare_execution_grant(connection.id, "Cursor")
+                    .unwrap(),
+            )
+            .unwrap();
+        let receipts_before = vault.receipts().unwrap().len();
+        assert!(
+            vault
+                .store_execution_credentials(
+                    grant.id,
+                    0,
+                    vec![
+                        ("FIRST_KEY".into(), SecretString::from("first")),
+                        ("FIRST_KEY".into(), SecretString::from("replacement")),
+                        ("SECOND_KEY".into(), SecretString::from("second")),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(vault.execution_credential_activations().unwrap().is_empty());
+        assert_eq!(vault.receipts().unwrap().len(), receipts_before);
+        let unchanged = vault.execution_grant(grant.id).unwrap().unwrap();
+        assert_eq!(unchanged.status, ExecutionGrantStatus::AwaitingCredentials);
+        assert_eq!(unchanged.revision, 0);
+        assert!(
+            unchanged
+                .required_credentials
+                .iter()
+                .all(|item| item.secret_ref.is_none())
+        );
+    }
+
+    #[test]
+    fn live_staged_execution_credential_write_is_not_reconciled_as_crash_residue() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let first = Vault::open_with_key(&path, [61_u8; 32]).unwrap();
+        first.create_profile("Live credential writer").unwrap();
+        let connection = environment_backed_stdio("live-writer-tools");
+        first.upsert_connection(&connection).unwrap();
+        let grant = first
+            .reserve_execution_grant(
+                first
+                    .prepare_execution_grant(connection.id, "Cursor")
+                    .unwrap(),
+            )
+            .unwrap();
+        let requirement = grant.required_credentials[0].clone();
+        let alias_directory = temp.path().join("alias");
+        fs::create_dir(&alias_directory).unwrap();
+        let alias_path = alias_directory.join("..").join("vault.db");
+        let second = Vault::open_with_key(&alias_path, [61_u8; 32]).unwrap();
+        assert_eq!(first.path, second.path);
+        let activation = ExecutionCredentialActivation {
+            id: Uuid::new_v4(),
+            grant_id: grant.id,
+            grant_revision: grant.revision,
+            kind: ExecutionCredentialActivationKind::Write,
+            credentials: vec![ExecutionCredentialWrite {
+                binding_id: requirement.binding_id,
+                name: requirement.name,
+                secret_ref: crate::execution::new_secret_reference(
+                    grant.id,
+                    requirement.binding_id,
+                ),
+            }],
+            state: ExecutionCredentialActivationState::Staged,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+        let activation_id = activation.id;
+        let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (reconciled_tx, reconciled_rx) = std::sync::mpsc::channel();
+
+        let writer = std::thread::spawn(move || {
+            first.with_execution_credential_lock(|| {
+                first.put(
+                    "execution_credential_activations",
+                    activation.id,
+                    &activation,
+                )?;
+                staged_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                first.db.execute(
+                    "DELETE FROM execution_credential_activations WHERE id=?1",
+                    params![activation.id.to_string()],
+                )?;
+                Ok(())
+            })
+        });
+        staged_rx.recv().unwrap();
+        let reconciler = std::thread::spawn(move || {
+            let result = second.reconcile_execution_credential_activations();
+            reconciled_tx.send(()).unwrap();
+            result
+        });
+
+        assert!(
+            reconciled_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        reconciler.join().unwrap().unwrap();
+
+        let reopened = Vault::open_with_key(&path, [61_u8; 32]).unwrap();
+        let journal: Option<ExecutionCredentialActivation> = reopened
+            .by_id("execution_credential_activations", activation_id)
+            .unwrap();
+        assert!(journal.is_none());
+        assert_eq!(
+            reopened.execution_grant(grant.id).unwrap().unwrap().status,
+            ExecutionGrantStatus::AwaitingCredentials
+        );
+    }
+
+    #[test]
+    fn concurrent_reconcilers_do_not_delete_finalized_execution_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let key = [62_u8; 32];
+        let first = Vault::open_with_key(&path, key).unwrap();
+        first.create_profile("Concurrent reconciliation").unwrap();
+        let connection = environment_backed_stdio("concurrent-reconcile-tools");
+        first.upsert_connection(&connection).unwrap();
+        let grant = first
+            .reserve_execution_grant(
+                first
+                    .prepare_execution_grant(connection.id, "Cursor")
+                    .unwrap(),
+            )
+            .unwrap();
+        let second = Vault::open_with_key(&path, key).unwrap();
+        let requirement = &grant.required_credentials[0];
+        let secret_ref = crate::execution::new_secret_reference(grant.id, requirement.binding_id);
+        let activation = ExecutionCredentialActivation {
+            id: Uuid::new_v4(),
+            grant_id: grant.id,
+            grant_revision: grant.revision,
+            kind: ExecutionCredentialActivationKind::Write,
+            credentials: vec![ExecutionCredentialWrite {
+                binding_id: requirement.binding_id,
+                name: requirement.name.clone(),
+                secret_ref: secret_ref.clone(),
+            }],
+            state: ExecutionCredentialActivationState::CredentialsWritten,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+        first
+            .put(
+                "execution_credential_activations",
+                activation.id,
+                &activation,
+            )
+            .unwrap();
+        first
+            .put_secret_value(
+                &secret_ref,
+                &SecretString::from(format!("concurrent-{}", Uuid::new_v4())),
+            )
+            .unwrap();
+
+        let one = std::thread::spawn(move || first.reconcile_execution_credential_activations());
+        let two = std::thread::spawn(move || second.reconcile_execution_credential_activations());
+        one.join().unwrap().unwrap();
+        two.join().unwrap().unwrap();
+
+        let reopened = Vault::open_with_key(&path, key).unwrap();
+        let ready = reopened.execution_grant(grant.id).unwrap().unwrap();
+        assert_eq!(ready.status, ExecutionGrantStatus::CredentialsReady);
+        assert!(reopened.secret_value_exists(&secret_ref).unwrap());
+        let missing = reopened
+            .forget_execution_credentials(ready.id, ready.revision)
+            .unwrap();
+        reopened
+            .cancel_execution_grant(missing.id, missing.revision)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_credential_lock_refuses_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let key = [63_u8; 32];
+        let vault = Vault::open_with_key(&path, key).unwrap();
+        let lock_path = vault.path.with_file_name(format!(
+            "{}.execution-credentials.lock",
+            vault.path.file_name().unwrap().to_str().unwrap()
+        ));
+        drop(vault);
+        fs::remove_file(&lock_path).unwrap();
+        let target = temp.path().join("attacker-controlled");
+        fs::write(&target, b"not a lock").unwrap();
+        symlink(&target, &lock_path).unwrap();
+
+        assert!(Vault::open_with_key(&path, key).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"not a lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_refuses_a_hard_link_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let key = [64_u8; 32];
+        let vault = Vault::open_with_key(&path, key).unwrap();
+        vault.create_profile("Hard-link identity").unwrap();
+        drop(vault);
+
+        let alias_directory = temp.path().join("other-private-directory");
+        fs::create_dir(&alias_directory).unwrap();
+        set_private_directory(&alias_directory).unwrap();
+        let alias = alias_directory.join("alias.db");
+        fs::hard_link(&path, &alias).unwrap();
+
+        assert!(Vault::open_with_key(&path, key).is_err());
+        assert!(Vault::open_with_key(&alias, key).is_err());
     }
 
     #[cfg(unix)]

@@ -1,6 +1,7 @@
 use crate::{
-    ConnectionDefinition, ExecutionCredentialStatus, ExecutionGrant, ExecutionGrantStatus,
-    StdioExecutionSnapshot,
+    ConnectionDefinition, ExecutionCredentialActivation, ExecutionCredentialActivationKind,
+    ExecutionCredentialActivationState, ExecutionCredentialStatus, ExecutionGrant,
+    ExecutionGrantStatus, StdioExecutionSnapshot,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -195,24 +196,96 @@ pub(crate) fn validate_execution_grant(grant: &ExecutionGrant) -> Result<()> {
         .iter()
         .zip(&grant.snapshot.credential_names)
     {
-        if requirement.name != *name
-            || requirement.status != ExecutionCredentialStatus::Missing
-            || !binding_ids.insert(requirement.binding_id)
-        {
+        if requirement.name != *name || !binding_ids.insert(requirement.binding_id) {
             bail!("execution grant credential requirements are invalid");
         }
     }
     match grant.status {
         ExecutionGrantStatus::AwaitingCredentials
-            if grant.revision == 0 && grant.cancelled_at.is_none() => {}
+            if grant.revision.is_multiple_of(2)
+                && grant.cancelled_at.is_none()
+                && grant.required_credentials.iter().all(|item| {
+                    item.status == ExecutionCredentialStatus::Missing && item.secret_ref.is_none()
+                }) => {}
+        ExecutionGrantStatus::CredentialsReady
+            if !grant.revision.is_multiple_of(2)
+                && grant.cancelled_at.is_none()
+                && grant.required_credentials.iter().all(|item| {
+                    item.status == ExecutionCredentialStatus::Stored
+                        && item.secret_ref.as_deref().is_some_and(|reference| {
+                            secret_reference_matches(reference, grant.id, item.binding_id)
+                        })
+                }) => {}
         ExecutionGrantStatus::Cancelled
-            if grant.revision == 1
+            if grant.revision >= 1
                 && grant
                     .cancelled_at
-                    .is_some_and(|cancelled_at| cancelled_at >= grant.created_at) => {}
+                    .is_some_and(|cancelled_at| cancelled_at >= grant.created_at)
+                && grant.required_credentials.iter().all(|item| {
+                    item.status == ExecutionCredentialStatus::Missing && item.secret_ref.is_none()
+                }) => {}
         _ => bail!("execution grant lifecycle state is invalid"),
     }
     Ok(())
+}
+
+pub(crate) fn validate_credential_activation(
+    activation: &ExecutionCredentialActivation,
+) -> Result<()> {
+    if activation.credentials.is_empty() || activation.credentials.len() > 128 {
+        bail!("execution credential activation has an invalid credential count");
+    }
+    let mut bindings = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    let mut references = std::collections::HashSet::new();
+    for credential in &activation.credentials {
+        validate_environment_name(&credential.name)?;
+        if !bindings.insert(credential.binding_id)
+            || !names.insert(credential.name.as_str())
+            || !references.insert(credential.secret_ref.as_str())
+            || !secret_reference_matches(
+                &credential.secret_ref,
+                activation.grant_id,
+                credential.binding_id,
+            )
+        {
+            bail!("execution credential activation contains invalid or duplicate fields");
+        }
+    }
+    match (&activation.kind, &activation.state) {
+        (
+            ExecutionCredentialActivationKind::Write,
+            ExecutionCredentialActivationState::Staged
+            | ExecutionCredentialActivationState::CredentialsWritten
+            | ExecutionCredentialActivationState::CleanupPending,
+        ) if activation.completed_at.is_none() => {}
+        (
+            ExecutionCredentialActivationKind::Delete,
+            ExecutionCredentialActivationState::CleanupPending,
+        ) if activation.completed_at.is_none() => {}
+        (_, ExecutionCredentialActivationState::Completed)
+            if activation
+                .completed_at
+                .is_some_and(|completed_at| completed_at >= activation.created_at) => {}
+        _ => bail!("execution credential activation lifecycle is invalid"),
+    }
+    Ok(())
+}
+
+pub(crate) fn new_secret_reference(grant_id: Uuid, binding_id: Uuid) -> String {
+    format!("execution/{grant_id}/{binding_id}/{}", Uuid::new_v4())
+}
+
+fn secret_reference_matches(value: &str, grant_id: Uuid, binding_id: Uuid) -> bool {
+    let mut parts = value.split('/');
+    parts.next() == Some("execution")
+        && parts.next().and_then(|part| Uuid::parse_str(part).ok()) == Some(grant_id)
+        && parts.next().and_then(|part| Uuid::parse_str(part).ok()) == Some(binding_id)
+        && parts
+            .next()
+            .and_then(|part| Uuid::parse_str(part).ok())
+            .is_some()
+        && parts.next().is_none()
 }
 
 pub(crate) fn connection_fingerprint(connection: &ConnectionDefinition) -> String {

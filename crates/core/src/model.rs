@@ -99,16 +99,19 @@ pub struct ExecutionCredentialRequirement {
     pub binding_id: Uuid,
     pub name: String,
     pub status: ExecutionCredentialStatus,
+    #[serde(default)]
+    pub(crate) secret_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionCredentialStatus {
     Missing,
+    Stored,
 }
 
-/// Phase-one execution grants are inert intent records only. There is no
-/// active state and no credential reference in this model.
+/// Phase-one execution grants remain inert: credentials may be held behind
+/// private Keychain references, but there is no active or executable state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionGrant {
@@ -129,13 +132,99 @@ pub struct ExecutionGrant {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionGrantStatus {
     AwaitingCredentials,
+    CredentialsReady,
     Cancelled,
+}
+
+/// Redacted projection safe for desktop/CLI status surfaces. Internal binding
+/// identifiers and Keychain references never appear here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionGrantView {
+    pub id: Uuid,
+    pub connection_id: Uuid,
+    pub host: String,
+    pub snapshot: StdioExecutionSnapshot,
+    pub snapshot_sha256: String,
+    pub required_credentials: Vec<ExecutionCredentialView>,
+    pub status: ExecutionGrantStatus,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCredentialView {
+    pub name: String,
+    pub status: ExecutionCredentialStatus,
+}
+
+impl From<&ExecutionGrant> for ExecutionGrantView {
+    fn from(grant: &ExecutionGrant) -> Self {
+        Self {
+            id: grant.id,
+            connection_id: grant.connection_id,
+            host: grant.host.clone(),
+            snapshot: grant.snapshot.clone(),
+            snapshot_sha256: grant.snapshot_sha256.clone(),
+            required_credentials: grant
+                .required_credentials
+                .iter()
+                .map(|item| ExecutionCredentialView {
+                    name: item.name.clone(),
+                    status: item.status.clone(),
+                })
+                .collect(),
+            status: grant.status.clone(),
+            revision: grant.revision,
+            created_at: grant.created_at,
+            cancelled_at: grant.cancelled_at,
+        }
+    }
 }
 
 impl ExecutionGrantStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCredentialActivation {
+    pub id: Uuid,
+    pub grant_id: Uuid,
+    pub grant_revision: u64,
+    pub kind: ExecutionCredentialActivationKind,
+    pub credentials: Vec<ExecutionCredentialWrite>,
+    pub state: ExecutionCredentialActivationState,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionCredentialActivationKind {
+    Write,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCredentialWrite {
+    pub binding_id: Uuid,
+    pub name: String,
+    pub(crate) secret_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionCredentialActivationState {
+    Staged,
+    CredentialsWritten,
+    CleanupPending,
+    Completed,
 }
 
 /// A provider authorization is independent from a host configuration deployment.
