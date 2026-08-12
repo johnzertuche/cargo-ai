@@ -9,6 +9,7 @@ COPY app ./app
 COPY .openai ./.openai
 COPY build ./build
 COPY public ./public
+COPY worker ./worker
 COPY next-env.d.ts next.config.ts postcss.config.mjs tsconfig.json vite.config.ts ./
 RUN npm run build
 
