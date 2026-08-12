@@ -15,12 +15,16 @@
 .provider-status { display: grid; gap: 3px; margin-top: 12px; padding: 10px 12px; border: 1px solid #c9dcc9; border-radius: 8px; background: #eff7ed; }
 .provider-status b { color: #2f6840; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 .provider-status small { overflow-wrap: anywhere; }
+.credential-status { display: grid; gap: 3px; margin-top: 9px; padding: 10px 12px; border: 1px solid #e2d2b8; border-radius: 8px; background: #fff8eb; }
+.credential-status b { color: #795522; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.credential-status small { overflow-wrap: anywhere; }
 .connection-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .connection-actions em { flex-basis: 100%; color: #8b5a24; font-size: 12px; font-style: normal; text-align: right; }
 .connection-actions button, .empty-state button { border: 1px solid #cbd5ca; border-radius: 8px; background: #f8faf7; color: #263027; cursor: pointer; font-size: 12px; font-weight: 750; padding: 9px 11px; }
 .connection-actions button:hover, .empty-state button:hover { background: #edf2eb; }
 .connection-actions button:disabled { cursor: not-allowed; opacity: .45; }
 .connection-actions button.text-danger, .record-actions button.text-danger { border-color: #e2c9c0; background: #fff8f5; color: #8b3f28; }
+.credential-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .empty-state { margin: 20px 0 36px; padding: 32px; border: 1px dashed #cbd4ca; border-radius: 14px; background: #fbfcfa; text-align: center; }
 .empty-state h2 { margin: 0 0 8px; font-size: 22px; }
 .empty-state p { color: #687168; }

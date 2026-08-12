@@ -66,6 +66,7 @@ describe("manual connection creation", () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "app_state") return readyState;
       if (command === "connection_records") return [];
+      if (command === "execution_grant_records") return [];
       if (command === "create_connection_definition") return {
         id: "connection-1",
         name: "acme-mcp",
@@ -110,6 +111,7 @@ describe("manual connection creation", () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "app_state") return readyState;
       if (command === "connection_records") return [];
+      if (command === "execution_grant_records") return [];
       if (command === "create_connection_definition") throw new Error("a connection with this name already exists");
       throw new Error(`Unexpected invoke: ${command}`);
     });
@@ -183,6 +185,7 @@ describe("provider local cleanup recovery", () => {
         provider_grants: [grant],
       };
       if (command === "connection_records") return [connection];
+      if (command === "execution_grant_records") return [];
       if (command === "finalize_provider_cleanup") return { ...grant, status: "verified_revoked" };
       throw new Error(`Unexpected invoke: ${command}`);
     });
@@ -202,5 +205,120 @@ describe("provider local cleanup recovery", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /finish local cleanup/i }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("finalize_provider_cleanup", { grantId: grant.id }));
     expect(await screen.findByText(/local keychain credential references were deleted/i)).toBeVisible();
+  });
+});
+
+describe("native execution credential custody", () => {
+  const connection = {
+    id: "connection-env",
+    name: "env-mcp",
+    transport: "stdio",
+    command: "/Applications/Example MCP.app/Contents/MacOS/server",
+    args: ["--mode", "  exact value  ", ""],
+    url: null,
+    environment_keys: ["EXAMPLE_API_KEY"],
+    metadata: { source: "Cursor" },
+  };
+  const host = { host: "Cursor", path: "/tmp/mcp.json", exists: true, can_import: true, can_install: true, command_path: null, fingerprint: null };
+  const preview = {
+    preview_id: "preview-execution",
+    connection_id: connection.id,
+    host: host.host,
+    command: connection.command,
+    args: connection.args,
+    credential_names: connection.environment_keys,
+    snapshot_sha256: "abc123",
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_state") return {
+        ...emptyState,
+        profile: { id: "profile-1", display_name: "Alex", created_at: "2026-08-12T00:00:00Z" },
+        hosts: [host],
+        connection_count: 1,
+        execution_grants: [],
+      };
+      if (command === "connection_records") return [connection];
+      if (command === "execution_grant_records") return [];
+      if (command === "preview_execution_credentials") return preview;
+      if (command === "reserve_and_collect_execution_credentials") return {
+        id: "grant-execution",
+        connection_id: connection.id,
+        host: host.host,
+        snapshot: { schema_version: 1, command: connection.command, args: connection.args, credential_names: connection.environment_keys, working_directory_policy: "none" },
+        snapshot_sha256: preview.snapshot_sha256,
+        required_credentials: [{ name: "EXAMPLE_API_KEY", status: "stored" }],
+        status: "credentials_ready",
+        revision: 1,
+        created_at: "2026-08-12T00:00:00Z",
+        cancelled_at: null,
+      };
+      throw new Error(`Unexpected invoke: ${command}`);
+    });
+  });
+
+  afterEach(cleanup);
+
+  it("reviews exact process metadata while sending no secret through renderer IPC", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Alex's vault" });
+    fireEvent.click(screen.getByRole("button", { name: /connections/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /resolve credentials for cursor/i }));
+    const dialog = await screen.findByRole("dialog", { name: /resolve credentials for cursor/i });
+    expect(dialog).toHaveTextContent(connection.command);
+    expect(dialog).toHaveTextContent("EXAMPLE_API_KEY");
+    expect(dialog).toHaveTextContent('""');
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    fireEvent.click(within(dialog).getByRole("button", { name: /continue in native macos prompts/i }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("reserve_and_collect_execution_credentials", { previewId: preview.preview_id }));
+    expect(JSON.stringify(invokeMock.mock.calls)).not.toContain("super-secret-value");
+    expect(document.body).not.toHaveTextContent("super-secret-value");
+    expect(await screen.findByText(/no process can use them until a separately reviewed broker/i)).toBeVisible();
+  });
+
+  it("requires confirmation to cancel an inert intent and releases the connection lifecycle", async () => {
+    const awaiting = {
+      id: "grant-awaiting",
+      connection_id: connection.id,
+      host: host.host,
+      snapshot: { schema_version: 1, command: connection.command, args: connection.args, credential_names: connection.environment_keys, working_directory_policy: "none" },
+      snapshot_sha256: preview.snapshot_sha256,
+      required_credentials: [{ name: "EXAMPLE_API_KEY", status: "missing" }],
+      status: "awaiting_credentials",
+      revision: 0,
+      created_at: "2026-08-12T00:00:00Z",
+      cancelled_at: null,
+    };
+    let cancelled = false;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_state") return {
+        ...emptyState,
+        profile: { id: "profile-1", display_name: "Alex", created_at: "2026-08-12T00:00:00Z" },
+        hosts: [host],
+        connection_count: 1,
+        execution_grants: cancelled ? [] : [awaiting],
+      };
+      if (command === "connection_records") return [connection];
+      if (command === "execution_grant_records") return cancelled ? [] : [awaiting];
+      if (command === "cancel_execution_credential_intent") {
+        cancelled = true;
+        return { ...awaiting, status: "cancelled", revision: 1 };
+      }
+      throw new Error(`Unexpected invoke: ${command}`);
+    });
+
+    render(<App />);
+    await screen.findByRole("button", { name: "Alex's vault" });
+    fireEvent.click(screen.getByRole("button", { name: /connections/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /cancel cursor credential intent/i }));
+    const dialog = await screen.findByRole("dialog", { name: /cancel cursor credential setup/i });
+    expect(invokeMock).not.toHaveBeenCalledWith("cancel_execution_credential_intent", expect.anything());
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel credential intent/i }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_execution_credential_intent", { grantId: awaiting.id, expectedRevision: awaiting.revision }));
+    expect(await screen.findByRole("button", { name: /delete definition/i })).toBeEnabled();
   });
 });

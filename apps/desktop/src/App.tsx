@@ -11,6 +11,9 @@ type ImportPreview = { import_id: string; source_profile: string; restores_profi
 type Receipt = { id: string; action: string; target: string; outcome: string; record_hash: string; created_at: string };
 type ProviderGrant = { id: string; connection_id: string; resource: string; issuer: string; scopes: string[]; access_expires_at: string | null; status: string; created_at: string; last_verified_at: string | null };
 type ProviderPreview = { preview_id: string; resource: string; issuer: string; scopes_supported: string[]; refresh_persistence: string };
+type ExecutionSnapshot = { schema_version: number; command: string; args: string[]; credential_names: string[]; working_directory_policy: string };
+type ExecutionGrant = { id: string; connection_id: string; host: string; snapshot: ExecutionSnapshot; snapshot_sha256: string; required_credentials: { name: string; status: "missing" | "stored" }[]; status: "awaiting_credentials" | "credentials_ready" | "cancelled"; revision: number; created_at: string; cancelled_at: string | null };
+type ExecutionPreview = { preview_id: string; connection_id: string; host: string; command: string; args: string[]; credential_names: string[]; snapshot_sha256: string };
 type Plan = { plan_id: string; host: string; server_name: string; config_path: string; operation: string; creates_config: boolean; preimage_sha256: string | null; result_sha256: string; warnings: string[]; transport: string; command: string | null; args: string[]; url: string | null; secret_references: string[] };
 type AppState = { profile: Profile | null; hosts: Host[]; deployments: Deployment[]; provider_grants: ProviderGrant[]; connection_count: number; memory_count: number; receipts: Receipt[]; receipt_chain_valid: boolean; vault_path: string };
 type View = "home" | "connections" | "memory" | "activity" | "privacy";
@@ -21,9 +24,11 @@ export default function App() {
   const [state, setState] = useState<AppState>(empty);
   const [memoryRecords, setMemoryRecords] = useState<MemoryRecord[]>([]);
   const [connectionRecords, setConnectionRecords] = useState<Connection[]>([]);
+  const [executionGrantRecords, setExecutionGrantRecords] = useState<ExecutionGrant[]>([]);
   const vaultGeneration = useRef(0);
   const memoryRequest = useRef(0);
   const connectionRequest = useRef(0);
+  const executionGrantRequest = useRef(0);
   const onboardingRestoreButton = useRef<HTMLButtonElement>(null);
   const [locked, setLocked] = useState(false);
   const [name, setName] = useState("");
@@ -51,6 +56,10 @@ export default function App() {
   const [providerTarget, setProviderTarget] = useState<Connection | null>(null);
   const [providerPreview, setProviderPreview] = useState<ProviderPreview | null>(null);
   const [providerCleanupTarget, setProviderCleanupTarget] = useState<ProviderGrant | null>(null);
+  const [executionPreview, setExecutionPreview] = useState<ExecutionPreview | null>(null);
+  const [executionTarget, setExecutionTarget] = useState<ExecutionGrant | null>(null);
+  const [executionForgetTarget, setExecutionForgetTarget] = useState<ExecutionGrant | null>(null);
+  const [executionCancelTarget, setExecutionCancelTarget] = useState<ExecutionGrant | null>(null);
 
   const refresh = async () => {
     const generation = vaultGeneration.current;
@@ -114,6 +123,15 @@ export default function App() {
     return records;
   };
 
+  const loadExecutionGrantRecords = async () => {
+    const generation = vaultGeneration.current;
+    const request = ++executionGrantRequest.current;
+    const records = await invoke<ExecutionGrant[]>("execution_grant_records");
+    if (generation !== vaultGeneration.current || request !== executionGrantRequest.current) return null;
+    setExecutionGrantRecords(records);
+    return records;
+  };
+
   useEffect(() => {
     if (view === "memory" && state.profile && !locked) {
       void loadMemoryRecords().catch(caught => setError(String(caught)));
@@ -126,9 +144,12 @@ export default function App() {
   useEffect(() => {
     if (view === "connections" && state.profile && !locked) {
       void loadConnectionRecords().catch(caught => setError(String(caught)));
+      void loadExecutionGrantRecords().catch(caught => setError(String(caught)));
     } else if (!exportMode) {
       connectionRequest.current += 1;
+      executionGrantRequest.current += 1;
       setConnectionRecords([]);
+      setExecutionGrantRecords([]);
     }
   }, [view, state.connection_count, state.profile?.id, locked, exportMode]);
 
@@ -159,8 +180,10 @@ export default function App() {
     vaultGeneration.current += 1;
     memoryRequest.current += 1;
     connectionRequest.current += 1;
+    executionGrantRequest.current += 1;
     setMemoryRecords([]);
     setConnectionRecords([]);
+    setExecutionGrantRecords([]);
     try { await invoke("lock_vault"); } finally {
       setState(empty);
       setPlan(null);
@@ -181,6 +204,10 @@ export default function App() {
       setProviderTarget(null);
       setProviderPreview(null);
       setProviderCleanupTarget(null);
+      setExecutionPreview(null);
+      setExecutionTarget(null);
+      setExecutionForgetTarget(null);
+      setExecutionCancelTarget(null);
       setProfileOpen(false);
       setNotice("");
       setError("");
@@ -382,6 +409,74 @@ export default function App() {
     }
   };
 
+  const previewExecutionCredentials = async (connectionId: string, host: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      setExecutionPreview(await invoke<ExecutionPreview>("preview_execution_credentials", { connectionId, host }));
+      setBusy(false);
+    } catch (caught) {
+      setError(String(caught));
+      setBusy(false);
+    }
+  };
+
+  const collectExecutionCredentials = async () => {
+    if (!executionPreview && !executionTarget) return;
+    setBusy(true);
+    setError("");
+    try {
+      const ready = executionPreview
+        ? await invoke<ExecutionGrant>("reserve_and_collect_execution_credentials", { previewId: executionPreview.preview_id })
+        : await invoke<ExecutionGrant>("collect_execution_credentials", { grantId: executionTarget!.id, expectedRevision: executionTarget!.revision });
+      setNotice(`${ready.host} credential custody is ready. Values are in macOS Keychain; no process can use them until a separately reviewed broker is implemented and activated.`);
+      setExecutionPreview(null);
+      setExecutionTarget(null);
+      await refresh();
+      if (view === "connections") await loadExecutionGrantRecords();
+    } catch (caught) {
+      setError(String(caught));
+      setExecutionPreview(null);
+      setExecutionTarget(null);
+      await refresh();
+    }
+  };
+
+  const forgetExecutionCredentials = async () => {
+    if (!executionForgetTarget) return;
+    setBusy(true);
+    setError("");
+    try {
+      await invoke("forget_execution_credentials", { grantId: executionForgetTarget.id, expectedRevision: executionForgetTarget.revision });
+      setNotice(`${executionForgetTarget.host} credential references were deleted from macOS Keychain. The inert execution intent remains available for a future replacement.`);
+      setExecutionForgetTarget(null);
+      await refresh();
+      if (view === "connections") await loadExecutionGrantRecords();
+    } catch (caught) {
+      setError(String(caught));
+      setExecutionForgetTarget(null);
+      await refresh();
+    }
+  };
+
+  const cancelExecutionIntent = async (): Promise<string | null> => {
+    if (!executionCancelTarget) return "Execution credential intent was not found.";
+    setBusy(true);
+    setError("");
+    try {
+      await invoke("cancel_execution_credential_intent", { grantId: executionCancelTarget.id, expectedRevision: executionCancelTarget.revision });
+      setNotice(`${executionCancelTarget.host} credential intent was cancelled. No credential values or executable authority remain.`);
+      setExecutionCancelTarget(null);
+      await refresh();
+      if (view === "connections") await loadExecutionGrantRecords();
+      return null;
+    } catch (caught) {
+      setError(String(caught));
+      setBusy(false);
+      return String(caught);
+    }
+  };
+
   const renameProfile = async (displayName: string) => {
     setBusy(true);
     try {
@@ -539,13 +634,13 @@ export default function App() {
 
   const connected = state.hosts.filter(host => host.exists).length;
   const activeDeployments = state.deployments.filter(item => item.state === "active");
-  const overlayOpen = Boolean(plan || exportMode || importOpen || backupOpen || encryptedImportOpen || importPreview || removalPlan || profileOpen || memoryToDelete || connectionToDelete || connectionCreateOpen || providerTarget || providerCleanupTarget);
+  const overlayOpen = Boolean(plan || exportMode || importOpen || backupOpen || encryptedImportOpen || importPreview || removalPlan || profileOpen || memoryToDelete || connectionToDelete || connectionCreateOpen || providerTarget || providerCleanupTarget || executionPreview || executionTarget || executionForgetTarget || executionCancelTarget);
   return <main className="shell">
     <aside inert={overlayOpen || busy}><div className="wordmark"><Mark /><b>CARGO</b><small>PRIVATE PREVIEW</small></div><nav>{([ ["home", "⌂", "Overview"], ["connections", "◇", "Connections"], ["memory", "◫", "Memory"], ["activity", "↗", "Receipts"], ["privacy", "◎", "Privacy"] ] as const).map(([id, icon, label]) => <button key={id} className={view === id ? "active" : ""} aria-current={view === id ? "page" : undefined} onClick={() => setView(id)}><i>{icon}</i>{label}</button>)}</nav><div className="local"><i>✓</i><div><b>Local-only mode</b><span>Soft-locks after 15 minutes</span></div><button onClick={() => void lock()} disabled={busy}>Lock</button></div></aside>
     <section className="workspace" inert={overlayOpen || busy}><header><div><button className="profile-button" onClick={() => setProfileOpen(true)}>{state.profile.display_name}'s vault</button><b>/</b><strong>{view[0].toUpperCase() + view.slice(1)}</strong></div><div><button className="secondary" onClick={() => setImportOpen(true)}>Import</button><button className="secondary" onClick={() => void beginExport("plain")}>Export portable pack</button><button onClick={() => void beginExport("encrypted")}>Export encrypted pack</button></div></header>
       <div className="content">{error && <div className="error" role="alert">{error}</div>}{notice && <div className="notice" role="status" aria-live="polite">{notice}<button aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
         {view === "home" && <><div className="heading"><span>DEVICE CONTROL PLANE / LOCAL</span><h1>Everything that makes AI yours.</h1><p>Your configurations and memory are encrypted on this Mac. Nothing here depends on a hosted Cargo service.</p></div><section className="metrics"><article className="hero"><span>LOCAL VAULT HEALTHY</span><strong>{connected}<small> / {state.hosts.length}</small></strong><h2>AI clients discovered</h2><p>Read-only discovery. Configuration changes always require a preview and approval.</p></article><article><span>CONNECTIONS</span><strong>{state.connection_count}</strong><p>Encrypted definitions</p></article><article><span>ACTIVE INSTALLS</span><strong>{activeDeployments.length}</strong><p>Reversible deployments</p></article></section><HostList hosts={state.hosts} onImport={importHost} /></>}
-        {view === "connections" && <Connections connections={connectionRecords} deployments={state.deployments} grants={state.provider_grants} hosts={state.hosts} onCreate={() => setConnectionCreateOpen(true)} onImport={importHost} onPreview={previewInstall} onRevoke={previewRemoval} onDelete={setConnectionToDelete} onAuthorize={previewProvider} onDisconnect={disconnectProvider} onFinalizeCleanup={setProviderCleanupTarget} />}
+        {view === "connections" && <Connections connections={connectionRecords} deployments={state.deployments} grants={state.provider_grants} executionGrants={executionGrantRecords} hosts={state.hosts} onCreate={() => setConnectionCreateOpen(true)} onImport={importHost} onPreview={previewInstall} onCredentialPreview={previewExecutionCredentials} onCredentialContinue={setExecutionTarget} onCredentialForget={setExecutionForgetTarget} onCredentialCancel={setExecutionCancelTarget} onRevoke={previewRemoval} onDelete={setConnectionToDelete} onAuthorize={previewProvider} onDisconnect={disconnectProvider} onFinalizeCleanup={setProviderCleanupTarget} />}
         {view === "memory" && <MemoryView memory={memoryRecords} hosts={state.hosts} onSave={saveMemory} onDelete={setMemoryToDelete} />}
         {view === "activity" && <><div className="heading"><span>HASH-CHAINED RECEIPTS</span><h1>Every local action, accounted for.</h1><p>Records present in this vault: <b className={state.receipt_chain_valid ? "good" : "bad"}>{state.receipt_chain_valid ? "Internally consistent" : "Chain invalid"}</b>. Tail deletion requires a future external checkpoint to detect.</p></div><section className="receipts">{state.receipts.map(receipt => <article key={receipt.id}><time>{new Date(receipt.created_at).toLocaleString()}</time><div><b>{receipt.action}</b><span>{receipt.target}</span></div><strong>✓ {receipt.outcome}</strong></article>)}</section></>}
         {view === "privacy" && <><div className="heading"><span>ZERO-CUSTODY BY DEFAULT</span><h1>Your device is the boundary.</h1><p>Cargo's website cannot inspect, reset, or recover this vault.</p></div><section className="privacy-grid"><article><b>Encrypted records</b><p>Profile, connection, memory, deployment, and receipt documents use authenticated per-record encryption.</p></article><article><b>OS-protected key</b><p>The vault master key lives in macOS Keychain—not in the database or exported portable packs.</p></article><article><b>Portable by choice</b><p>Portable packs contain only explicitly selected definitions and memory. Known credential fields are removed, but arbitrary configuration can still be sensitive and must be reviewed.</p></article><article><b>Transparent limits</b><p>The encrypted pack is not full-vault recovery: deployments, receipts, provider grants, and Keychain credentials are excluded.</p></article></section><div className="path">Vault location <code>{state.vault_path}</code></div></>}
@@ -564,6 +659,9 @@ export default function App() {
     {connectionCreateOpen && <ConnectionCreateModal busy={busy} onClose={() => setConnectionCreateOpen(false)} onCreate={createConnection} />}
     {providerTarget && providerPreview && <ProviderAuthorizationModal connection={providerTarget} preview={providerPreview} busy={busy} onClose={() => { setProviderTarget(null); setProviderPreview(null); }} onConnect={connectProvider} />}
     {providerCleanupTarget && <ProviderCleanupModal grant={providerCleanupTarget} busy={busy} onClose={() => setProviderCleanupTarget(null)} onFinalize={finalizeProviderCleanup} />}
+    {(executionPreview || executionTarget) && <ExecutionCredentialModal review={executionPreview ?? executionTarget!} busy={busy} onClose={() => { setExecutionPreview(null); setExecutionTarget(null); }} onCollect={collectExecutionCredentials} />}
+    {executionForgetTarget && <ExecutionCredentialForgetModal grant={executionForgetTarget} busy={busy} onClose={() => setExecutionForgetTarget(null)} onForget={forgetExecutionCredentials} />}
+    {executionCancelTarget && <ExecutionCredentialCancelModal grant={executionCancelTarget} busy={busy} onClose={() => setExecutionCancelTarget(null)} onCancelIntent={cancelExecutionIntent} />}
   </main>;
 }
 
@@ -631,10 +729,10 @@ function HostList({ hosts, onImport }: { hosts: Host[]; onImport: (host: string)
   return <section className="hosts"><header><div><h2>AI clients on this Mac</h2><p>Supported documented configuration and official CLI surfaces</p></div><span>{hosts.filter(host => host.exists).length} discovered</span></header>{hosts.map(host => <article key={host.host}><div className="host-icon">{host.host[0]}</div><div><b>{host.host}</b><code>{host.path}</code></div>{host.can_import ? <button className="import" onClick={() => void onImport(host.host)}>Import definitions</button> : host.can_install ? <span className="found">✓ Official CLI ready</span> : <span className="not-found">○ Not found</span>}</article>)}</section>;
 }
 
-function Connections({ connections, deployments, grants, hosts, onCreate, onImport, onPreview, onRevoke, onDelete, onAuthorize, onDisconnect, onFinalizeCleanup }: { connections: Connection[]; deployments: Deployment[]; grants: ProviderGrant[]; hosts: Host[]; onCreate: () => void; onImport: (host: string) => Promise<void>; onPreview: (connectionId: string, host: string) => Promise<void>; onRevoke: (deployment: Deployment) => Promise<void>; onDelete: (connection: Connection) => void; onAuthorize: (connection: Connection) => Promise<void>; onDisconnect: (grant: ProviderGrant) => Promise<void>; onFinalizeCleanup: (grant: ProviderGrant) => void }) {
+function Connections({ connections, deployments, grants, executionGrants, hosts, onCreate, onImport, onPreview, onCredentialPreview, onCredentialContinue, onCredentialForget, onCredentialCancel, onRevoke, onDelete, onAuthorize, onDisconnect, onFinalizeCleanup }: { connections: Connection[]; deployments: Deployment[]; grants: ProviderGrant[]; executionGrants: ExecutionGrant[]; hosts: Host[]; onCreate: () => void; onImport: (host: string) => Promise<void>; onPreview: (connectionId: string, host: string) => Promise<void>; onCredentialPreview: (connectionId: string, host: string) => Promise<void>; onCredentialContinue: (grant: ExecutionGrant) => void; onCredentialForget: (grant: ExecutionGrant) => void; onCredentialCancel: (grant: ExecutionGrant) => void; onRevoke: (deployment: Deployment) => Promise<void>; onDelete: (connection: Connection) => void; onAuthorize: (connection: Connection) => Promise<void>; onDisconnect: (grant: ProviderGrant) => Promise<void>; onFinalizeCleanup: (grant: ProviderGrant) => void }) {
   const destinations = hosts.filter(item => item.can_install);
   return <><div className="heading connection-heading"><div><span>PORTABLE, REVERSIBLE CONNECTIONS</span><h1>Move definitions safely.</h1><p>Importing removes known credential fields; arbitrary configuration still requires review. Installing previews one exact owned change, and removal stops if that entry later drifts.</p></div><button onClick={onCreate}>Add connection</button></div>
-    {connections.length === 0 ? <section className="empty-state"><h2>No definitions in your vault yet.</h2><p>Add a reviewed remote URL or local stdio definition, or import from a discovered AI client. Do not paste API keys or tokens.</p><div><button onClick={onCreate}>Add connection manually</button>{hosts.filter(host => host.can_import).map(host => <button key={host.host} onClick={() => void onImport(host.host)}>Import from {host.host}</button>)}</div></section> : <section className="connection-list">{connections.map(connection => { const hasManagedDeployment = deployments.some(deployment => deployment.connection_id === connection.id && deployment.state !== "host_removed"); const grant = grants.find(item => item.connection_id === connection.id && item.status !== "verified_revoked"); const isRemote = connection.transport !== "stdio" && Boolean(connection.url); return <article key={connection.id}><div><span>{connection.transport.replace("_", " ")}</span><h2>{connection.name}</h2><p>{connection.command ?? connection.url}</p><small>{connection.metadata.source === "manual" ? "Created on this device" : `Imported from ${connection.metadata.source ?? "local pack"}`}</small>{grant && <div className="provider-status"><b>Provider / {grant.status.replaceAll("_", " ")}</b><small>{grant.issuer} · {grant.scopes.length ? grant.scopes.join(", ") : "default scope"}</small></div>}</div><div className="connection-actions">{connection.environment_keys.length > 0 && <em>Authorization required: {connection.environment_keys.join(", ")}</em>}{isRemote && !grant && <button onClick={() => void onAuthorize(connection)}>Authorize with Cargo</button>}{grant && !["verified_revoked", "local_cleanup_pending"].includes(grant.status) && <button className="text-danger" onClick={() => void onDisconnect(grant)}>{grant.status === "authorization_pending" ? "Cancel authorization" : "Disconnect provider"}</button>}{grant?.status === "local_cleanup_pending" && <button className="text-danger" onClick={() => void onFinalizeCleanup(grant)}>Finish local cleanup</button>}{destinations.map(host => { const nativeConnector = host.host === "Claude Desktop" && connection.transport !== "stdio"; return <button key={host.host} title={nativeConnector ? "Claude requires remote connectors to be added in its native Settings > Connectors interface." : undefined} disabled={connection.environment_keys.length > 0 || nativeConnector} onClick={() => void onPreview(connection.id, host.host)}>{nativeConnector ? "Use Claude Connectors" : `Install in ${host.host}`}</button>; })}<button className="text-danger" title={hasManagedDeployment || Boolean(grant) ? "Resolve every managed deployment and provider authorization first." : "Delete this encrypted definition from Cargo."} disabled={hasManagedDeployment || Boolean(grant)} onClick={() => onDelete(connection)}>{hasManagedDeployment || grant ? "Resolve lifecycle first" : "Delete definition"}</button></div></article>; })}</section>}
+    {connections.length === 0 ? <section className="empty-state"><h2>No definitions in your vault yet.</h2><p>Add a reviewed remote URL or local stdio definition, or import from a discovered AI client. Do not paste API keys or tokens.</p><div><button onClick={onCreate}>Add connection manually</button>{hosts.filter(host => host.can_import).map(host => <button key={host.host} onClick={() => void onImport(host.host)}>Import from {host.host}</button>)}</div></section> : <section className="connection-list">{connections.map(connection => { const hasManagedDeployment = deployments.some(deployment => deployment.connection_id === connection.id && deployment.state !== "host_removed"); const grant = grants.find(item => item.connection_id === connection.id && item.status !== "verified_revoked"); const connectionExecutionGrants = executionGrants.filter(item => item.connection_id === connection.id && item.status !== "cancelled"); const hasExecutionGrant = connectionExecutionGrants.length > 0; const isRemote = connection.transport !== "stdio" && Boolean(connection.url); return <article key={connection.id}><div><span>{connection.transport.replace("_", " ")}</span><h2>{connection.name}</h2><p>{connection.command ?? connection.url}</p><small>{connection.metadata.source === "manual" ? "Created on this device" : `Imported from ${connection.metadata.source ?? "local pack"}`}</small>{grant && <div className="provider-status"><b>Provider / {grant.status.replaceAll("_", " ")}</b><small>{grant.issuer} · {grant.scopes.length ? grant.scopes.join(", ") : "default scope"}</small></div>}{connectionExecutionGrants.map(item => <div className="credential-status" key={item.id} role="status"><b>{item.host} / {item.status === "credentials_ready" ? "credentials stored locally" : "credentials required"}</b><small>{item.required_credentials.map(credential => credential.name).join(", ")} · inert; execution is disabled</small></div>)}</div><div className="connection-actions">{connection.environment_keys.length > 0 && <em>Local credentials required: {connection.environment_keys.join(", ")}. Values are collected by a native macOS prompt, never this webview.</em>}{isRemote && !grant && <button onClick={() => void onAuthorize(connection)}>Authorize with Cargo</button>}{grant && !["verified_revoked", "local_cleanup_pending"].includes(grant.status) && <button className="text-danger" onClick={() => void onDisconnect(grant)}>{grant.status === "authorization_pending" ? "Cancel authorization" : "Disconnect provider"}</button>}{grant?.status === "local_cleanup_pending" && <button className="text-danger" onClick={() => void onFinalizeCleanup(grant)}>Finish local cleanup</button>}{destinations.map(host => { const nativeConnector = host.host === "Claude Desktop" && connection.transport !== "stdio"; const executionGrant = connectionExecutionGrants.find(item => item.host === host.host); if (connection.environment_keys.length > 0) return executionGrant ? <span className="credential-actions" key={host.host}><button onClick={() => onCredentialContinue(executionGrant)} disabled={executionGrant.status === "credentials_ready"}>{executionGrant.status === "credentials_ready" ? `Credentials ready for ${host.host}` : `Continue credential setup for ${host.host}`}</button>{executionGrant.status === "credentials_ready" ? <button className="text-danger" onClick={() => onCredentialForget(executionGrant)}>Forget {host.host} credentials</button> : <button className="text-danger" onClick={() => onCredentialCancel(executionGrant)}>Cancel {host.host} credential intent</button>}</span> : <button key={host.host} onClick={() => void onCredentialPreview(connection.id, host.host)}>Resolve credentials for {host.host}</button>; return <button key={host.host} title={nativeConnector ? "Claude requires remote connectors to be added in its native Settings > Connectors interface." : undefined} disabled={nativeConnector} onClick={() => void onPreview(connection.id, host.host)}>{nativeConnector ? "Use Claude Connectors" : `Install in ${host.host}`}</button>; })}<button className="text-danger" title={hasManagedDeployment || Boolean(grant) || hasExecutionGrant ? "Resolve every managed deployment, provider authorization, and local credential intent first." : "Delete this encrypted definition from Cargo."} disabled={hasManagedDeployment || Boolean(grant) || hasExecutionGrant} onClick={() => onDelete(connection)}>{hasManagedDeployment || grant || hasExecutionGrant ? "Resolve lifecycle first" : "Delete definition"}</button></div></article>; })}</section>}
     <div className="subheading"><span>MANAGED DEPLOYMENTS</span><h2>Registered installs and host removals</h2></div><section className="deployment-list">{deployments.length === 0 ? <p>No managed deployments yet.</p> : deployments.map(item => <article key={item.id}><div><b>{item.server_name}</b><span>{item.host}</span><code>{item.config_path}</code></div><strong className={`state ${item.state}`}>{item.state.replace("_", " ")}</strong>{(item.state === "active" || item.state === "local_blocked") && <button className="danger" onClick={() => void onRevoke(item)}>{item.state === "local_blocked" ? "Retry host removal" : "Remove from host"}</button>}</article>)}</section>
   </>;
 }
@@ -693,6 +791,33 @@ function ProviderCleanupModal({ grant, busy, onClose, onFinalize }: { grant: Pro
   const [confirmed, setConfirmed] = useState(false);
   const dialogRef = useDialog(onClose, busy);
   return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="provider-cleanup-title"><span>LOCAL CREDENTIAL CLEANUP</span><h2 id="provider-cleanup-title">Finish local cleanup?</h2><p>Provider revocation evidence is already complete. This step performs no provider network request and does not change AI-client host registrations.</p><dl><div><dt>Issuer</dt><dd>{grant.issuer}</dd></div><div><dt>Current state</dt><dd>{grant.status.replaceAll("_", " ")}</dd></div><div><dt>Local effect</dt><dd>Delete access and any refresh credential references from Keychain</dd></div></dl><p>After verified local deletion, the provider grant becomes terminal and this connection can be deleted once its host deployments are also removed.</p><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I understand this irreversibly deletes Cargo's remaining local Keychain credential references and does not remove host registrations.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button className="danger" onClick={() => void onFinalize(grant)} disabled={!confirmed || busy}>{busy ? "Deleting local credentials…" : "Finish local cleanup"}</button></div></section></div>;
+}
+
+function ExecutionCredentialModal({ review, busy, onClose, onCollect }: { review: ExecutionPreview | ExecutionGrant; busy: boolean; onClose: () => void; onCollect: () => Promise<void> }) {
+  const [confirmed, setConfirmed] = useState(false);
+  const dialogRef = useDialog(onClose, busy);
+  const preview = "preview_id" in review;
+  const command = preview ? review.command : review.snapshot.command;
+  const args = preview ? review.args : review.snapshot.args;
+  const names = preview ? review.credential_names : review.required_credentials.map(item => item.name);
+  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal wide" role="dialog" aria-modal="true" aria-labelledby="execution-credential-title"><span>INERT LOCAL CREDENTIAL INTENT</span><h2 id="execution-credential-title">Resolve credentials for {review.host}?</h2><p>Review the exact local process and credential names. After approval, macOS—not this app window—will ask for each value in a native hidden-input prompt.</p><div className="execution-preview"><b>Future reviewed executable</b><code>{command}</code><b>Exact ordered arguments (JSON escaped)</b>{args.length ? <ol>{args.map((argument, index) => <li key={index}><code>{JSON.stringify(argument)}</code></li>)}</ol> : <p>No arguments</p>}<b>Credential names only</b><ul>{names.map(name => <li key={name}><code>{name}</code></li>)}</ul></div><p>Values are written to opaque macOS Keychain entries and excluded from the webview, vault database, receipts, host configuration, and portable packs. This checkpoint cannot launch the process or install a host registration; stored credentials remain inert.</p><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I reviewed the executable, every JSON-escaped argument, destination host, and credential name. I understand the future child process would receive these values in its environment only after a separate broker review and activation.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button onClick={() => void onCollect()} disabled={!confirmed || busy}>{busy ? "Waiting for native credential entry…" : "Continue in native macOS prompts"}</button></div></section></div>;
+}
+
+function ExecutionCredentialForgetModal({ grant, busy, onClose, onForget }: { grant: ExecutionGrant; busy: boolean; onClose: () => void; onForget: () => Promise<void> }) {
+  const [confirmed, setConfirmed] = useState(false);
+  const dialogRef = useDialog(onClose, busy);
+  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="execution-forget-title"><span>LOCAL KEYCHAIN CLEANUP</span><h2 id="execution-forget-title">Forget {grant.host} credentials?</h2><p>This locally blocks future use by returning the inert intent to “credentials required,” then deletes and verifies absence of its opaque Keychain entries. It does not revoke or rotate keys at their provider.</p><dl><div><dt>Credential names</dt><dd>{grant.required_credentials.map(item => item.name).join(", ")}</dd></div><div><dt>Host registrations</dt><dd>None; execution and broker installation are not enabled</dd></div></dl><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I understand this deletes Cargo's local Keychain copies and that provider-side rotation or revocation is separate.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button className="danger" onClick={() => void onForget()} disabled={!confirmed || busy}>{busy ? "Deleting local credentials…" : "Forget local credentials"}</button></div></section></div>;
+}
+
+function ExecutionCredentialCancelModal({ grant, busy, onClose, onCancelIntent }: { grant: ExecutionGrant; busy: boolean; onClose: () => void; onCancelIntent: () => Promise<string | null> }) {
+  const [confirmed, setConfirmed] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const dialogRef = useDialog(onClose, busy);
+  const submit = async () => {
+    const failure = await onCancelIntent();
+    if (failure) setSubmitError(failure);
+  };
+  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="execution-cancel-title"><span>CANCEL INERT CREDENTIAL INTENT</span><h2 id="execution-cancel-title">Cancel {grant.host} credential setup?</h2><p>No executable authority or host registration exists. Cancellation removes the lifecycle block while retaining a terminal encrypted audit record. It does not contact a provider or delete credentials because none are stored for this intent.</p>{submitError && <div className="error modal-error" role="alert" aria-live="assertive">{submitError}</div>}<dl><div><dt>Host</dt><dd>{grant.host}</dd></div><div><dt>Credential names</dt><dd>{grant.required_credentials.map(item => item.name).join(", ")}</dd></div><div><dt>Current revision</dt><dd>{grant.revision}</dd></div></dl><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />Cancel this exact inert intent and allow the connection definition to be deleted or reviewed again.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Keep intent</button><button className="danger" onClick={() => void submit()} disabled={!confirmed || busy}>{busy ? "Cancelling…" : "Cancel credential intent"}</button></div></section></div>;
 }
 
 function MemoryView({ memory, hosts, onSave, onDelete }: { memory: MemoryRecord[]; hosts: Host[]; onSave: (memoryId: string | null, title: string, body: string, sensitivity: string, allowedHosts: string[]) => Promise<void>; onDelete: (memory: MemoryRecord) => void }) {

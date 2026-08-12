@@ -562,6 +562,7 @@ dependencies = [
  "anyhow",
  "cargo-ai-core",
  "chrono",
+ "secrecy",
  "serde",
  "serde_json",
  "tauri",
@@ -570,6 +571,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

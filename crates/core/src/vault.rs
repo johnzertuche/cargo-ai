@@ -962,6 +962,9 @@ impl Vault {
         }
         for credential in &activation.credentials {
             self.delete_secret_value(&credential.secret_ref)?;
+            if self.secret_value_exists(&credential.secret_ref)? {
+                bail!("execution credential remains present after Keychain deletion");
+            }
         }
         if activation.kind == ExecutionCredentialActivationKind::Delete {
             let grant: ExecutionGrant = self

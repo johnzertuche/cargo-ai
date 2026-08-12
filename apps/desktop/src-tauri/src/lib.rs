@@ -1,8 +1,9 @@
 use cargo_ai_core::{
-    ClientRegistrationKind, ConnectionDefinition, GrantStatus, LocalProfile, ManagedDeployment,
-    MemoryRecord, PackImportResult, PortablePack, ProviderGrant, RevocationVerification,
-    Sensitivity, TokenRevocationResult, Vault,
+    ClientRegistrationKind, ConnectionDefinition, ExecutionGrantStatus, ExecutionGrantView,
+    GrantStatus, LocalProfile, ManagedDeployment, MemoryRecord, PackImportResult, PortablePack,
+    ProviderGrant, RevocationVerification, Sensitivity, TokenRevocationResult, Vault,
     adapters::{HostSnapshot, discover_known},
+    execution::ExecutionGrantPreview,
     host_ops::{
         PlannedInstall, PlannedRemoval, apply_recorded_install, apply_recorded_removal,
         import_host_configuration as import_host, plan_install, plan_removal,
@@ -18,10 +19,12 @@ use cargo_ai_core::{
     validate_portable_pack,
 };
 use chrono::Utc;
+use secrecy::SecretString;
 use serde::Serialize;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -29,6 +32,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 struct AppRuntime {
     vault: Mutex<VaultSession>,
@@ -38,6 +42,7 @@ struct AppRuntime {
     removals: Mutex<HashMap<Uuid, PendingRemoval>>,
     imports: Mutex<HashMap<Uuid, PendingImport>>,
     provider_previews: Mutex<HashMap<Uuid, PendingProviderPreview>>,
+    execution_previews: Mutex<HashMap<Uuid, PendingExecutionPreview>>,
 }
 
 struct VaultSession {
@@ -64,6 +69,11 @@ struct PendingImport {
 struct PendingProviderPreview {
     connection_id: Uuid,
     metadata: ValidatedAuthorizationMetadata,
+    created_at: Instant,
+}
+
+struct PendingExecutionPreview {
+    preview: ExecutionGrantPreview,
     created_at: Instant,
 }
 
@@ -94,6 +104,10 @@ fn active_vault(app: &AppRuntime) -> Result<MutexGuard<'_, VaultSession>, String
         .map_err(err)?
         .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
     app.provider_previews
+        .lock()
+        .map_err(err)?
+        .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
+    app.execution_previews
         .lock()
         .map_err(err)?
         .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
@@ -176,6 +190,17 @@ struct ProviderAuthorizationPreview {
     issuer: String,
     scopes_supported: Vec<String>,
     refresh_persistence: &'static str,
+}
+
+#[derive(Serialize)]
+struct ExecutionCredentialPreview {
+    preview_id: Uuid,
+    connection_id: Uuid,
+    host: String,
+    command: String,
+    args: Vec<String>,
+    credential_names: Vec<String>,
+    snapshot_sha256: String,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -580,6 +605,202 @@ fn connection_records(app: State<'_, AppRuntime>) -> Result<Vec<ConnectionDefini
 }
 
 #[tauri::command]
+fn execution_grant_records(app: State<'_, AppRuntime>) -> Result<Vec<ExecutionGrantView>, String> {
+    let session = active_vault(&app)?;
+    vault_ref(&session)?.execution_grant_views().map_err(err)
+}
+
+#[tauri::command]
+fn preview_execution_credentials(
+    connection_id: String,
+    host: String,
+    app: State<'_, AppRuntime>,
+) -> Result<ExecutionCredentialPreview, String> {
+    let connection_id = Uuid::parse_str(&connection_id).map_err(err)?;
+    if !discover_known(&home_dir()?)
+        .iter()
+        .any(|candidate| candidate.host == host && candidate.can_install)
+    {
+        return Err("The selected AI client is not available for reviewed installation".into());
+    }
+    let preview = {
+        let session = active_vault(&app)?;
+        vault_ref(&session)?
+            .prepare_execution_grant(connection_id, &host)
+            .map_err(err)?
+    };
+    let response = ExecutionCredentialPreview {
+        preview_id: preview.id(),
+        connection_id: preview.connection_id(),
+        host: preview.host().into(),
+        command: preview.snapshot().command.clone(),
+        args: preview.snapshot().args.clone(),
+        credential_names: preview.snapshot().credential_names.clone(),
+        snapshot_sha256: preview.snapshot_sha256().into(),
+    };
+    let mut previews = app.execution_previews.lock().map_err(err)?;
+    previews.retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
+    if previews.len() >= 16 {
+        return Err("Too many pending credential reviews; finish or cancel one first".into());
+    }
+    previews.insert(
+        response.preview_id,
+        PendingExecutionPreview {
+            preview,
+            created_at: Instant::now(),
+        },
+    );
+    Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_execution_secret(name: &str) -> Result<SecretString, String> {
+    const SCRIPT: &str = r#"on run argv
+set credentialName to item 1 of argv
+set response to display dialog ("Enter " & credentialName & " for Cargo's reviewed local process grant. The value will be stored in macOS Keychain and never returned to the app window.") default answer "" with hidden answer buttons {"Cancel", "Store in Keychain"} default button "Store in Keychain" cancel button "Cancel" with title "Cargo credential custody"
+return text returned of response
+end run"#;
+    let output = Command::new("/usr/bin/osascript")
+        .env_clear()
+        .arg("-e")
+        .arg(SCRIPT)
+        .arg("--")
+        .arg(name)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "The native macOS credential prompt could not open".to_string())?;
+    let bytes = Zeroizing::new(output.stdout);
+    if !output.status.success() {
+        return Err("Credential entry was cancelled; no new value was stored".into());
+    }
+    let mut value = Zeroizing::new(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| "The native credential prompt returned invalid text".to_string())?
+            .to_owned(),
+    );
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    if value.is_empty() {
+        return Err("Credential values cannot be empty".into());
+    }
+    Ok(SecretString::from(std::mem::take(&mut *value)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prompt_execution_secret(_name: &str) -> Result<SecretString, String> {
+    Err("Native execution credential entry is currently available only on macOS".into())
+}
+
+fn prompt_execution_values(
+    grant: &ExecutionGrantView,
+) -> Result<Vec<(String, SecretString)>, String> {
+    grant
+        .required_credentials
+        .iter()
+        .map(|credential| {
+            prompt_execution_secret(&credential.name).map(|value| (credential.name.clone(), value))
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn reserve_and_collect_execution_credentials(
+    preview_id: String,
+    app: State<'_, AppRuntime>,
+) -> Result<ExecutionGrantView, String> {
+    let preview_id = Uuid::parse_str(&preview_id).map_err(err)?;
+    let pending = app
+        .execution_previews
+        .lock()
+        .map_err(err)?
+        .remove(&preview_id)
+        .ok_or("Credential preview expired or was already used")?;
+    if pending.created_at.elapsed() >= Duration::from_secs(300) {
+        return Err("Credential preview expired; review the process grant again".into());
+    }
+    let view = {
+        let session = active_vault(&app)?;
+        let vault = vault_ref(&session)?;
+        let grant = vault
+            .reserve_execution_grant(pending.preview)
+            .map_err(err)?;
+        vault
+            .execution_grant_view(grant.id)
+            .map_err(err)?
+            .ok_or("Reserved execution grant was not found")?
+    };
+    let values = prompt_execution_values(&view)?;
+    let session = active_vault(&app)?;
+    let vault = vault_ref(&session)?;
+    vault
+        .store_execution_credentials(view.id, view.revision, values)
+        .map_err(err)
+}
+
+#[tauri::command]
+fn collect_execution_credentials(
+    grant_id: String,
+    expected_revision: u64,
+    app: State<'_, AppRuntime>,
+) -> Result<ExecutionGrantView, String> {
+    let grant_id = Uuid::parse_str(&grant_id).map_err(err)?;
+    let grant = {
+        let session = active_vault(&app)?;
+        vault_ref(&session)?
+            .execution_grant_view(grant_id)
+            .map_err(err)?
+            .ok_or("Execution grant was not found")?
+    };
+    if grant.status != ExecutionGrantStatus::AwaitingCredentials
+        || grant.revision != expected_revision
+    {
+        return Err("Execution grant changed after review".into());
+    }
+    let values = prompt_execution_values(&grant)?;
+    let session = active_vault(&app)?;
+    let vault = vault_ref(&session)?;
+    vault
+        .store_execution_credentials(grant.id, grant.revision, values)
+        .map_err(err)
+}
+
+#[tauri::command]
+fn forget_execution_credentials(
+    grant_id: String,
+    expected_revision: u64,
+    app: State<'_, AppRuntime>,
+) -> Result<ExecutionGrantView, String> {
+    let grant_id = Uuid::parse_str(&grant_id).map_err(err)?;
+    let session = active_vault(&app)?;
+    vault_ref(&session)?
+        .forget_execution_credentials(grant_id, expected_revision)
+        .map_err(err)
+}
+
+#[tauri::command]
+fn cancel_execution_credential_intent(
+    grant_id: String,
+    expected_revision: u64,
+    app: State<'_, AppRuntime>,
+) -> Result<ExecutionGrantView, String> {
+    let grant_id = Uuid::parse_str(&grant_id).map_err(err)?;
+    let session = active_vault(&app)?;
+    let vault = vault_ref(&session)?;
+    let cancelled = vault
+        .cancel_execution_grant(grant_id, expected_revision)
+        .map_err(err)?;
+    vault
+        .execution_grant_view(cancelled.id)
+        .map_err(err)?
+        .ok_or("Cancelled execution intent was not found".into())
+}
+
+#[tauri::command]
 fn touch_vault(app: State<'_, AppRuntime>) -> Result<(), String> {
     active_vault(&app).map(|_| ())
 }
@@ -599,6 +820,10 @@ fn purge_expired_previews(app: State<'_, AppRuntime>) -> Result<(), String> {
         .map_err(err)?
         .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
     app.provider_previews
+        .lock()
+        .map_err(err)?
+        .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
+    app.execution_previews
         .lock()
         .map_err(err)?
         .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
@@ -684,6 +909,7 @@ fn lock_vault(app: State<AppRuntime>) -> Result<(), String> {
     app.removals.lock().map_err(err)?.clear();
     app.imports.lock().map_err(err)?.clear();
     app.provider_previews.lock().map_err(err)?.clear();
+    app.execution_previews.lock().map_err(err)?.clear();
     Ok(())
 }
 
@@ -1120,11 +1346,18 @@ pub fn run() {
             removals: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
             provider_previews: Mutex::new(HashMap::new()),
+            execution_previews: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             app_state,
             memory_records,
             connection_records,
+            execution_grant_records,
+            preview_execution_credentials,
+            reserve_and_collect_execution_credentials,
+            collect_execution_credentials,
+            forget_execution_credentials,
+            cancel_execution_credential_intent,
             preview_provider_authorization,
             connect_provider,
             cancel_provider_authorization,
@@ -1172,6 +1405,7 @@ mod tests {
             removals: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
             provider_previews: Mutex::new(HashMap::new()),
+            execution_previews: Mutex::new(HashMap::new()),
         }
     }
 
