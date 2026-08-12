@@ -32,7 +32,7 @@ jobs:
           go install github.com/zricethezav/gitleaks/v8@v8.28.0
           "$GOBIN/gitleaks" git --redact --exit-code 1 --no-banner
           fixture="$(mktemp -d)"
-          printf '%s%s\n%s\n' '-----BEGIN ' 'PRIVATE KEY-----' 'synthetic-cargo-policy-fixture' > "$fixture/leak.pem"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$fixture/leak.pem" 2>/dev/null
           set +e
           "$GOBIN/gitleaks" dir "$fixture" --redact --exit-code 1 --no-banner >/dev/null 2>&1
           fixture_result="$?"
