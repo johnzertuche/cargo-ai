@@ -1,5 +1,5 @@
 const repo = "https://github.com/johnzertuche/cargo-ai";
-const preview = `${repo}/releases/tag/v0.1.0-preview.2`;
+const preview = `${repo}/releases/tag/v0.1.0-preview.3`;
 
 const hosts = [
   ["Claude", "/brand-claude.svg"],

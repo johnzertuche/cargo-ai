@@ -29,7 +29,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 
 ## Desktop app
 
-The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.2) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
+The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.3) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
 
 Source prerequisites: macOS, Node.js 22+, and current stable Rust.
 
@@ -55,7 +55,13 @@ cargo run -p cargo-ai-cli -- init --name "Ada"
 cargo run -p cargo-ai-cli -- status
 cargo run -p cargo-ai-cli -- rename-profile --name "Ada Lovelace"
 cargo run -p cargo-ai-cli -- discover
+cargo run -p cargo-ai-cli -- import-host --host Cursor
 cargo run -p cargo-ai-cli -- connections
+# Argument-bearing installs require an interactive exact-value review; --yes cannot bypass it:
+cargo run -p cargo-ai-cli -- install CONNECTION_UUID --host Cursor --show-values
+cargo run -p cargo-ai-cli -- deployments
+# Host registration removal does not log out OAuth or revoke provider-side access:
+cargo run -p cargo-ai-cli -- remove-deployment DEPLOYMENT_UUID
 printf 'Prefer concise updates' | cargo run -p cargo-ai-cli -- memory add --title "Working style"
 cargo run -p cargo-ai-cli -- memory list
 # Edit and delete use the UUIDs shown by the list commands:

@@ -32,6 +32,7 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 ## Non-goals and honest limits
 
 - Cargo cannot protect plaintext from malware or an administrator controlling the OS while the vault/app is unlocked.
+- Cargo does not claim resistance to a malicious process already running as the same OS user. Trusted host CLI execution reduces risk with canonical release roots, strict macOS signature and Team ID checks, a fixed environment, and executable fingerprints, but an active same-user process may still race local files during an approved operation.
 - Host registration removal cannot invalidate a provider credential copied outside Cargo.
 - An encrypted portable pack cannot be recovered if its passphrase is lost.
 - The current preview does not transfer live OAuth refresh tokens and does not claim provider-side revocation.

@@ -236,6 +236,7 @@ pub fn sanitize_connection_definition(
     if definition.name.trim().is_empty() || definition.name.chars().count() > 200 {
         bail!("connection name must be between 1 and 200 characters");
     }
+    validate_server_identifier(&definition.name)?;
     if definition.command.is_some() == definition.url.is_some() {
         bail!("connection must contain exactly one of command or url");
     }
@@ -306,6 +307,20 @@ pub fn sanitize_connection_definition(
         environment_keys,
         metadata,
     })
+}
+
+pub fn validate_server_identifier(name: &str) -> Result<()> {
+    if name.len() > 128
+        || name.starts_with('-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "connection name must be a safe 1-128 character identifier using only letters, numbers, dot, underscore, or hyphen, and cannot start with a hyphen"
+        );
+    }
+    Ok(())
 }
 
 fn sanitize_url(raw: &str) -> Result<(String, Vec<String>)> {

@@ -40,7 +40,7 @@ export default function App() {
   const [passphrase, setPassphrase] = useState("");
   const [passphraseAgain, setPassphraseAgain] = useState("");
   const [importPassphrase, setImportPassphrase] = useState("");
-  const [deploymentToRemove, setDeploymentToRemove] = useState<Deployment | null>(null);
+  const [removalPlan, setRemovalPlan] = useState<Plan | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [memoryToDelete, setMemoryToDelete] = useState<MemoryRecord | null>(null);
   const [connectionToDelete, setConnectionToDelete] = useState<Connection | null>(null);
@@ -167,7 +167,7 @@ export default function App() {
       setPassphrase("");
       setPassphraseAgain("");
       setImportPassphrase("");
-      setDeploymentToRemove(null);
+      setRemovalPlan(null);
       setMemoryToDelete(null);
       setConnectionToDelete(null);
       setProfileOpen(false);
@@ -394,13 +394,20 @@ export default function App() {
     }
   };
 
+  const previewRemoval = async (deployment: Deployment) => {
+    try {
+      setError("");
+      setRemovalPlan(await invoke<Plan>("plan_connection_removal", { deploymentId: deployment.id }));
+    } catch (caught) { setError(String(caught)); }
+  };
+
   const revoke = async () => {
-    if (!deploymentToRemove) return;
+    if (!removalPlan) return;
     setBusy(true);
     try {
-      await invoke("revoke_connection_deployment", { deploymentId: deploymentToRemove.id });
-      setNotice(`${deploymentToRemove.server_name} was removed from ${deploymentToRemove.host}'s configuration. Existing sessions and provider credentials were not revoked.`);
-      setDeploymentToRemove(null);
+      await invoke("apply_connection_removal", { planId: removalPlan.plan_id });
+      setNotice(`${removalPlan.server_name} was removed from ${removalPlan.host}'s configuration. Existing sessions and provider credentials were not revoked.`);
+      setRemovalPlan(null);
       await refresh();
     } catch (caught) {
       setError(String(caught));
@@ -418,13 +425,13 @@ export default function App() {
 
   const connected = state.hosts.filter(host => host.exists).length;
   const activeDeployments = state.deployments.filter(item => item.state === "active");
-  const overlayOpen = Boolean(plan || exportMode || importOpen || backupOpen || encryptedImportOpen || importPreview || deploymentToRemove || profileOpen || memoryToDelete || connectionToDelete);
+  const overlayOpen = Boolean(plan || exportMode || importOpen || backupOpen || encryptedImportOpen || importPreview || removalPlan || profileOpen || memoryToDelete || connectionToDelete);
   return <main className="shell">
     <aside inert={overlayOpen || busy}><div className="wordmark"><Mark /><b>CARGO</b><small>PRIVATE PREVIEW</small></div><nav>{([ ["home", "⌂", "Overview"], ["connections", "◇", "Connections"], ["memory", "◫", "Memory"], ["activity", "↗", "Receipts"], ["privacy", "◎", "Privacy"] ] as const).map(([id, icon, label]) => <button key={id} className={view === id ? "active" : ""} aria-current={view === id ? "page" : undefined} onClick={() => setView(id)}><i>{icon}</i>{label}</button>)}</nav><div className="local"><i>✓</i><div><b>Local-only mode</b><span>Soft-locks after 15 minutes</span></div><button onClick={() => void lock()} disabled={busy}>Lock</button></div></aside>
     <section className="workspace" inert={overlayOpen || busy}><header><div><button className="profile-button" onClick={() => setProfileOpen(true)}>{state.profile.display_name}'s vault</button><b>/</b><strong>{view[0].toUpperCase() + view.slice(1)}</strong></div><div><button className="secondary" onClick={() => setImportOpen(true)}>Import</button><button className="secondary" onClick={() => void beginExport("plain")}>Export portable pack</button><button onClick={() => void beginExport("encrypted")}>Export encrypted pack</button></div></header>
       <div className="content">{error && <div className="error" role="alert">{error}</div>}{notice && <div className="notice" role="status" aria-live="polite">{notice}<button aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
         {view === "home" && <><div className="heading"><span>DEVICE CONTROL PLANE / LOCAL</span><h1>Everything that makes AI yours.</h1><p>Your configurations and memory are encrypted on this Mac. Nothing here depends on a hosted Cargo service.</p></div><section className="metrics"><article className="hero"><span>LOCAL VAULT HEALTHY</span><strong>{connected}<small> / {state.hosts.length}</small></strong><h2>AI clients discovered</h2><p>Read-only discovery. Configuration changes always require a preview and approval.</p></article><article><span>CONNECTIONS</span><strong>{state.connection_count}</strong><p>Encrypted definitions</p></article><article><span>ACTIVE INSTALLS</span><strong>{activeDeployments.length}</strong><p>Reversible deployments</p></article></section><HostList hosts={state.hosts} onImport={importHost} /></>}
-        {view === "connections" && <Connections connections={connectionRecords} deployments={state.deployments} hosts={state.hosts} onImport={importHost} onPreview={previewInstall} onRevoke={setDeploymentToRemove} onDelete={setConnectionToDelete} />}
+        {view === "connections" && <Connections connections={connectionRecords} deployments={state.deployments} hosts={state.hosts} onImport={importHost} onPreview={previewInstall} onRevoke={previewRemoval} onDelete={setConnectionToDelete} />}
         {view === "memory" && <MemoryView memory={memoryRecords} hosts={state.hosts} onSave={saveMemory} onDelete={setMemoryToDelete} />}
         {view === "activity" && <><div className="heading"><span>HASH-CHAINED RECEIPTS</span><h1>Every local action, accounted for.</h1><p>Records present in this vault: <b className={state.receipt_chain_valid ? "good" : "bad"}>{state.receipt_chain_valid ? "Internally consistent" : "Chain invalid"}</b>. Tail deletion requires a future external checkpoint to detect.</p></div><section className="receipts">{state.receipts.map(receipt => <article key={receipt.id}><time>{new Date(receipt.created_at).toLocaleString()}</time><div><b>{receipt.action}</b><span>{receipt.target}</span></div><strong>✓ {receipt.outcome}</strong></article>)}</section></>}
         {view === "privacy" && <><div className="heading"><span>ZERO-CUSTODY BY DEFAULT</span><h1>Your device is the boundary.</h1><p>Cargo's website cannot inspect, reset, or recover this vault.</p></div><section className="privacy-grid"><article><b>Encrypted records</b><p>Profile, connection, memory, deployment, and receipt documents use authenticated per-record encryption.</p></article><article><b>OS-protected key</b><p>The vault master key lives in macOS Keychain—not in the database or exported portable packs.</p></article><article><b>Portable by choice</b><p>Portable packs contain definitions and memory, never credentials. Passphrase encryption protects a pack in transit.</p></article><article><b>Transparent limits</b><p>The current encrypted pack is not a full-vault recovery: deployments, receipts, and Keychain credentials are excluded.</p></article></section><div className="path">Vault location <code>{state.vault_path}</code></div></>}
@@ -436,7 +443,7 @@ export default function App() {
     {backupOpen && <BackupModal passphrase={passphrase} passphraseAgain={passphraseAgain} busy={busy} onPassphrase={setPassphrase} onPassphraseAgain={setPassphraseAgain} onClose={closeBackup} onExport={backup} />}
     {encryptedImportOpen && <ImportModal passphrase={importPassphrase} busy={busy} onPassphrase={setImportPassphrase} onClose={() => { setEncryptedImportOpen(false); setImportPassphrase(""); }} onImport={importEncrypted} />}
     {importPreview && <ImportPreviewModal preview={importPreview} busy={busy} onClose={() => setImportPreview(null)} onImport={applyImport} />}
-    {deploymentToRemove && <RemoveModal deployment={deploymentToRemove} busy={busy} onClose={() => setDeploymentToRemove(null)} onRemove={revoke} />}
+    {removalPlan && <RemoveModal plan={removalPlan} busy={busy} onClose={() => setRemovalPlan(null)} onRemove={revoke} />}
     {profileOpen && <ProfileModal profile={state.profile} busy={busy} onClose={() => setProfileOpen(false)} onRename={renameProfile} />}
     {memoryToDelete && <DeleteRecordModal kind="memory" name={memoryToDelete.title} busy={busy} onClose={() => setMemoryToDelete(null)} onDelete={deleteMemory} />}
     {connectionToDelete && <DeleteRecordModal kind="connection" name={connectionToDelete.name} busy={busy} onClose={() => setConnectionToDelete(null)} onDelete={deleteConnection} />}
@@ -507,7 +514,7 @@ function HostList({ hosts, onImport }: { hosts: Host[]; onImport: (host: string)
   return <section className="hosts"><header><div><h2>AI clients on this Mac</h2><p>Supported documented configuration and official CLI surfaces</p></div><span>{hosts.filter(host => host.exists).length} discovered</span></header>{hosts.map(host => <article key={host.host}><div className="host-icon">{host.host[0]}</div><div><b>{host.host}</b><code>{host.path}</code></div>{host.can_import ? <button className="import" onClick={() => void onImport(host.host)}>Import definitions</button> : host.can_install ? <span className="found">✓ Official CLI ready</span> : <span className="not-found">○ Not found</span>}</article>)}</section>;
 }
 
-function Connections({ connections, deployments, hosts, onImport, onPreview, onRevoke, onDelete }: { connections: Connection[]; deployments: Deployment[]; hosts: Host[]; onImport: (host: string) => Promise<void>; onPreview: (connectionId: string, host: string) => Promise<void>; onRevoke: (deployment: Deployment) => void; onDelete: (connection: Connection) => void }) {
+function Connections({ connections, deployments, hosts, onImport, onPreview, onRevoke, onDelete }: { connections: Connection[]; deployments: Deployment[]; hosts: Host[]; onImport: (host: string) => Promise<void>; onPreview: (connectionId: string, host: string) => Promise<void>; onRevoke: (deployment: Deployment) => Promise<void>; onDelete: (connection: Connection) => void }) {
   const destinations = hosts.filter(item => item.can_install);
   return <><div className="heading"><span>PORTABLE, REVERSIBLE CONNECTIONS</span><h1>Move definitions safely.</h1><p>Importing discards credential values. Installing previews one exact owned change; removal stops if that entry later drifts.</p></div>
     {connections.length === 0 ? <section className="empty-state"><h2>No definitions in your vault yet.</h2><p>Import from a discovered AI client to begin. Credentials remain in the source client's store.</p><div>{hosts.filter(host => host.can_import).map(host => <button key={host.host} onClick={() => void onImport(host.host)}>Import from {host.host}</button>)}</div></section> : <section className="connection-list">{connections.map(connection => { const hasManagedDeployment = deployments.some(deployment => deployment.connection_id === connection.id && deployment.state !== "host_removed"); return <article key={connection.id}><div><span>{connection.transport.replace("_", " ")}</span><h2>{connection.name}</h2><p>{connection.command ?? connection.url}</p><small>Imported from {connection.metadata.source ?? "local pack"}</small></div><div className="connection-actions">{connection.environment_keys.length > 0 && <em>Authorization required: {connection.environment_keys.join(", ")}</em>}{destinations.map(host => { const nativeConnector = host.host === "Claude Desktop" && connection.transport !== "stdio"; return <button key={host.host} title={nativeConnector ? "Claude requires remote connectors to be added in its native Settings > Connectors interface." : undefined} disabled={connection.environment_keys.length > 0 || nativeConnector} onClick={() => void onPreview(connection.id, host.host)}>{nativeConnector ? "Use Claude Connectors" : `Install in ${host.host}`}</button>; })}<button className="text-danger" title={hasManagedDeployment ? "Resolve or remove every managed host deployment first." : "Delete this encrypted definition from Cargo."} disabled={hasManagedDeployment} onClick={() => onDelete(connection)}>{hasManagedDeployment ? "Resolve deployments first" : "Delete definition"}</button></div></article>; })}</section>}
@@ -566,8 +573,8 @@ function BackupModal({ passphrase, passphraseAgain, busy, onPassphrase, onPassph
   return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="backup-title"><span>ENCRYPTED PORTABLE PACK</span><h2 id="backup-title">Protect definitions and memory.</h2><p>This is not a full vault backup. It excludes credentials, deployments, receipts, and the Keychain vault key. Cargo cannot recover the passphrase.</p><label>Passphrase<input type="password" autoComplete="new-password" value={passphrase} onChange={event => onPassphrase(event.target.value)} autoFocus /></label><label>Confirm passphrase<input type="password" autoComplete="new-password" value={passphraseAgain} onChange={event => onPassphraseAgain(event.target.value)} /></label>{passphraseAgain && passphrase !== passphraseAgain && <em className="field-error">Passphrases do not match.</em>}<div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button onClick={() => void onExport()} disabled={!valid || busy}>{busy ? "Encrypting…" : "Choose destination and export"}</button></div></section></div>;
 }
 
-function RemoveModal({ deployment, busy, onClose, onRemove }: { deployment: Deployment; busy: boolean; onClose: () => void; onRemove: () => Promise<void> }) {
+function RemoveModal({ plan, busy, onClose, onRemove }: { plan: Plan; busy: boolean; onClose: () => void; onRemove: () => Promise<void> }) {
   const [confirmed, setConfirmed] = useState(false);
   const dialogRef = useDialog(onClose, busy);
-  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="remove-title"><span>HOST CONFIGURATION ONLY</span><h2 id="remove-title">Remove {deployment.server_name} from {deployment.host}?</h2><p>Cargo will remove only its managed entry from <code>{deployment.config_path}</code> and will stop if that entry changed.</p><ul><li>Already-running client sessions may remain active until the client restarts.</li><li>Local OAuth credentials and provider-side access are not revoked.</li><li>Unrelated host settings are preserved.</li></ul><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I understand this is a host-config removal, not provider revocation.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button className="danger" onClick={() => void onRemove()} disabled={!confirmed || busy}>{busy ? "Removing…" : "Remove managed entry"}</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="remove-title"><span>EXACT HOST-REMOVAL PLAN</span><h2 id="remove-title">Remove {plan.server_name} from {plan.host}?</h2><p>Cargo will invoke or edit only the target below. This one-use plan expires after five minutes and stops if its fingerprint changes.</p><div className="execution-preview">{plan.command && <><b>Verified executable</b><code>{plan.command}</code></>}{plan.args.length > 0 && <><b>Exact arguments</b><ol>{plan.args.map((argument, index) => <li key={`${index}-${argument}`}><code>{argument}</code></li>)}</ol></>}<b>Target</b><code>{plan.config_path}</code></div><ul>{plan.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I reviewed the exact removal target and understand this is not provider revocation.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button className="danger" onClick={() => void onRemove()} disabled={!confirmed || busy}>{busy ? "Removing…" : "Apply exact removal"}</button></div></section></div>;
 }

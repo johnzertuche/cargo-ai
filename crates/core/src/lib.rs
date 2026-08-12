@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod host_ops;
 pub mod model;
 pub mod mutation;
 pub mod transfer;
