@@ -32,7 +32,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 
 ## Desktop app
 
-The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.5) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
+The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.6) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
 
 Source prerequisites: macOS, Node.js 22+, and current stable Rust.
 
