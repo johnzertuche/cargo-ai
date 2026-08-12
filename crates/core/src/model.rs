@@ -79,6 +79,65 @@ pub enum DeploymentState {
     Failed,
 }
 
+/// An immutable, inert snapshot of one reviewed local stdio definition.
+///
+/// This is deliberately separate from `ConnectionDefinition`: future broker
+/// execution must never follow later edits to a mutable portable definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StdioExecutionSnapshot {
+    pub schema_version: u32,
+    pub command: String,
+    pub args: Vec<String>,
+    pub credential_names: Vec<String>,
+    pub working_directory_policy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCredentialRequirement {
+    pub binding_id: Uuid,
+    pub name: String,
+    pub status: ExecutionCredentialStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionCredentialStatus {
+    Missing,
+}
+
+/// Phase-one execution grants are inert intent records only. There is no
+/// active state and no credential reference in this model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionGrant {
+    pub id: Uuid,
+    pub connection_id: Uuid,
+    pub host: String,
+    pub source_fingerprint: String,
+    pub snapshot: StdioExecutionSnapshot,
+    pub snapshot_sha256: String,
+    pub required_credentials: Vec<ExecutionCredentialRequirement>,
+    pub status: ExecutionGrantStatus,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionGrantStatus {
+    AwaitingCredentials,
+    Cancelled,
+}
+
+impl ExecutionGrantStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
 /// A provider authorization is independent from a host configuration deployment.
 /// Secret references are opaque identifiers; token values never belong in this model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

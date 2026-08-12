@@ -1,8 +1,9 @@
 use crate::{
-    AuditReceipt, ConnectionDefinition, DeploymentState, GrantActivationOperation,
+    AuditReceipt, ConnectionDefinition, DeploymentState, ExecutionCredentialRequirement,
+    ExecutionCredentialStatus, ExecutionGrant, ExecutionGrantStatus, GrantActivationOperation,
     GrantActivationState, LocalProfile, ManagedDeployment, MemoryRecord, PackImportResult,
     PortablePack, ProviderGrant, RevocationOperation, RevocationVerification,
-    TokenRevocationResult,
+    TokenRevocationResult, execution::ExecutionGrantPreview,
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
@@ -128,6 +129,15 @@ impl Vault {
           CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS execution_grants (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS execution_grant_owners (
+            owner_key TEXT PRIMARY KEY,
+            grant_id TEXT NOT NULL UNIQUE,
+            connection_id TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS consumed_execution_previews (
+            preview_id TEXT PRIMARY KEY
+          );
           CREATE TABLE IF NOT EXISTS provider_grants (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS provider_lifecycle_owners (
             connection_id TEXT PRIMARY KEY,
@@ -156,6 +166,7 @@ impl Vault {
             "memory",
             "receipts",
             "deployments",
+            "execution_grants",
             "provider_grants",
             "grant_activations",
             "revocations",
@@ -387,32 +398,52 @@ impl Vault {
     }
 
     pub fn delete_connection(&self, id: Uuid) -> Result<()> {
-        let connection = self.connection(id)?.context("connection was not found")?;
-        let is_managed = self.deployments()?.iter().any(|deployment| {
-            deployment.connection_id == id && deployment.state != DeploymentState::HostRemoved
-        });
-        if is_managed {
-            bail!("remove every active managed host deployment before deleting this connection");
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let connection = self.connection(id)?.context("connection was not found")?;
+            let is_managed = self.deployments()?.iter().any(|deployment| {
+                deployment.connection_id == id && deployment.state != DeploymentState::HostRemoved
+            });
+            if is_managed {
+                bail!(
+                    "remove every active managed host deployment before deleting this connection"
+                );
+            }
+            if self
+                .provider_grants()?
+                .iter()
+                .any(|grant| grant.connection_id == id && !grant.status.is_terminal())
+            {
+                bail!(
+                    "verify or explicitly resolve every provider grant before deleting this connection"
+                );
+            }
+            if self
+                .execution_grants()?
+                .iter()
+                .any(|grant| grant.connection_id == id && !grant.status.is_terminal())
+            {
+                bail!("cancel every pending local execution grant before deleting this connection");
+            }
+            self.delete_row("connections", id)?;
+            self.receipt(
+                "connection.deleted",
+                &id.to_string(),
+                "success",
+                &connection.name,
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        if self
-            .provider_grants()?
-            .iter()
-            .any(|grant| grant.connection_id == id && !grant.status.is_terminal())
-        {
-            bail!(
-                "verify or explicitly resolve every provider grant before deleting this connection"
-            );
-        }
-        let transaction = self.db.unchecked_transaction()?;
-        self.delete_row("connections", id)?;
-        self.receipt(
-            "connection.deleted",
-            &id.to_string(),
-            "success",
-            &connection.name,
-        )?;
-        transaction.commit()?;
-        Ok(())
     }
 
     fn put<T: serde::Serialize>(&self, table: &str, id: Uuid, item: &T) -> Result<()> {
@@ -459,6 +490,220 @@ impl Vault {
     }
     pub fn deployments(&self) -> Result<Vec<ManagedDeployment>> {
         self.all("deployments", true)
+    }
+
+    /// Creates an inert preview from the current encrypted definition. The
+    /// returned object cannot be caller-constructed or used to activate code.
+    pub fn prepare_execution_grant(
+        &self,
+        connection_id: Uuid,
+        host: &str,
+    ) -> Result<ExecutionGrantPreview> {
+        let profile = self.profile()?.context("create a local profile first")?;
+        let connection = self
+            .connection(connection_id)?
+            .context("connection was not found")?;
+        crate::execution::prepare_execution_grant_preview(profile.id, &connection, host)
+    }
+
+    /// Atomically consumes one fresh backend preview and records an inert,
+    /// immutable execution intent. This method cannot store credentials,
+    /// install host configuration, spawn a process, or create an active grant.
+    pub fn reserve_execution_grant(
+        &self,
+        preview: ExecutionGrantPreview,
+    ) -> Result<ExecutionGrant> {
+        if Utc::now() >= preview.expires_at() {
+            bail!("execution preview expired; create a new preview");
+        }
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            if Utc::now() >= preview.expires_at() {
+                bail!("execution preview expired while waiting for the vault write lock");
+            }
+            let profile = self.profile()?.context("local profile was not found")?;
+            if profile.id != preview.expected_profile_id() {
+                bail!("the local profile changed after this execution preview");
+            }
+            let connection = self
+                .connection(preview.connection_id())?
+                .context("connection was not found")?;
+            let current = crate::execution::prepare_execution_grant_preview(
+                profile.id,
+                &connection,
+                preview.host(),
+            )?;
+            if current.source_fingerprint() != preview.source_fingerprint()
+                || current.snapshot_sha256() != preview.snapshot_sha256()
+            {
+                bail!("the connection changed after this execution preview");
+            }
+            self.db.execute(
+                "INSERT INTO consumed_execution_previews(preview_id) VALUES (?1)",
+                params![preview.id().to_string()],
+            )?;
+            let id = Uuid::new_v4();
+            let owner_key = crate::execution::owner_key(preview.connection_id(), preview.host());
+            self.db.execute(
+                "INSERT INTO execution_grant_owners(owner_key,grant_id,connection_id) VALUES (?1,?2,?3)",
+                params![owner_key, id.to_string(), preview.connection_id().to_string()],
+            )?;
+            let grant = ExecutionGrant {
+                id,
+                connection_id: preview.connection_id(),
+                host: preview.host().into(),
+                source_fingerprint: preview.source_fingerprint().into(),
+                snapshot: preview.snapshot().clone(),
+                snapshot_sha256: preview.snapshot_sha256().into(),
+                required_credentials: preview
+                    .snapshot()
+                    .credential_names
+                    .iter()
+                    .map(|name| ExecutionCredentialRequirement {
+                        binding_id: Uuid::new_v4(),
+                        name: name.clone(),
+                        status: ExecutionCredentialStatus::Missing,
+                    })
+                    .collect(),
+                status: ExecutionGrantStatus::AwaitingCredentials,
+                revision: 0,
+                created_at: Utc::now(),
+                cancelled_at: None,
+            };
+            crate::execution::validate_execution_grant(&grant)?;
+            self.put("execution_grants", grant.id, &grant)?;
+            self.receipt(
+                "execution_grant.reserved",
+                &grant.id.to_string(),
+                "awaiting_credentials",
+                &grant.snapshot_sha256,
+            )?;
+            Ok::<ExecutionGrant, anyhow::Error>(grant)
+        })();
+        match result {
+            Ok(grant) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(grant)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn execution_grant(&self, id: Uuid) -> Result<Option<ExecutionGrant>> {
+        let grant: Option<ExecutionGrant> = self.by_id("execution_grants", id)?;
+        grant
+            .map(|grant| self.validate_execution_grant_owner(grant))
+            .transpose()
+    }
+
+    pub fn execution_grants(&self) -> Result<Vec<ExecutionGrant>> {
+        self.validate_execution_owner_index()?;
+        self.all::<ExecutionGrant>("execution_grants", true)?
+            .into_iter()
+            .map(|grant| self.validate_execution_grant_owner(grant))
+            .collect()
+    }
+
+    /// Cancels only an inert, credential-free grant using revision compare and
+    /// swap semantics. The encrypted terminal record is retained for audit.
+    pub fn cancel_execution_grant(
+        &self,
+        grant_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<ExecutionGrant> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut grant: ExecutionGrant = self
+                .by_id("execution_grants", grant_id)?
+                .context("execution grant was not found")?;
+            grant = self.validate_execution_grant_owner(grant)?;
+            if grant.status != ExecutionGrantStatus::AwaitingCredentials
+                || grant.revision != expected_revision
+            {
+                bail!("execution grant changed after it was reviewed");
+            }
+            grant.status = ExecutionGrantStatus::Cancelled;
+            grant.revision += 1;
+            grant.cancelled_at = Some(Utc::now());
+            crate::execution::validate_execution_grant(&grant)?;
+            let owner_key = crate::execution::owner_key(grant.connection_id, &grant.host);
+            let removed = self.db.execute(
+                "DELETE FROM execution_grant_owners WHERE owner_key=?1 AND grant_id=?2",
+                params![owner_key, grant.id.to_string()],
+            )?;
+            if removed != 1 {
+                bail!("execution grant ownership changed");
+            }
+            self.put("execution_grants", grant.id, &grant)?;
+            self.receipt(
+                "execution_grant.cancelled",
+                &grant.id.to_string(),
+                "success",
+                "credential-free-intent",
+            )?;
+            Ok::<ExecutionGrant, anyhow::Error>(grant)
+        })();
+        match result {
+            Ok(grant) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(grant)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn validate_execution_grant_owner(&self, grant: ExecutionGrant) -> Result<ExecutionGrant> {
+        crate::execution::validate_execution_grant(&grant)?;
+        let owner_key = crate::execution::owner_key(grant.connection_id, &grant.host);
+        let owner: Option<String> = self
+            .db
+            .query_row(
+                "SELECT grant_id FROM execution_grant_owners WHERE owner_key=?1",
+                params![owner_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let grant_id = grant.id.to_string();
+        match grant.status {
+            ExecutionGrantStatus::AwaitingCredentials
+                if owner.as_deref() == Some(grant_id.as_str()) => {}
+            ExecutionGrantStatus::Cancelled if owner.as_deref() != Some(grant_id.as_str()) => {}
+            _ => bail!("execution grant ownership is corrupt or inconsistent"),
+        }
+        Ok(grant)
+    }
+
+    fn validate_execution_owner_index(&self) -> Result<()> {
+        let mut statement = self
+            .db
+            .prepare("SELECT owner_key,grant_id,connection_id FROM execution_grant_owners")?;
+        let owners: Vec<(String, String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        for (owner_key, grant_id, connection_id) in owners {
+            let grant_id =
+                Uuid::parse_str(&grant_id).context("invalid execution owner grant ID")?;
+            let connection_id =
+                Uuid::parse_str(&connection_id).context("invalid execution owner connection ID")?;
+            let grant: ExecutionGrant = self
+                .by_id("execution_grants", grant_id)?
+                .context("execution owner references a missing encrypted grant")?;
+            crate::execution::validate_execution_grant(&grant)?;
+            if grant.status != ExecutionGrantStatus::AwaitingCredentials
+                || grant.connection_id != connection_id
+                || owner_key != crate::execution::owner_key(connection_id, &grant.host)
+            {
+                bail!("execution owner index is corrupt or inconsistent");
+            }
+        }
+        Ok(())
     }
 
     pub fn provider_grants(&self) -> Result<Vec<ProviderGrant>> {
@@ -615,6 +860,12 @@ impl Vault {
         }
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            if self.connection(grant.connection_id)?.is_none() {
+                bail!("provider grant references an unknown connection");
+            }
+            if self.provider_grant(grant.id)?.is_some() {
+                bail!("connection already has an unresolved provider authorization");
+            }
             self.claim_provider_lifecycle(grant.connection_id, grant.id)?;
             self.put("provider_grants", grant.id, grant)?;
             self.receipt(
@@ -640,21 +891,21 @@ impl Vault {
     /// Removes a browser-flow reservation only while it is still known to
     /// contain no issued credentials.
     pub fn cancel_provider_authorization(&self, grant_id: Uuid) -> Result<()> {
-        let grant = self
-            .provider_grant(grant_id)?
-            .context("provider authorization reservation was not found")?;
-        if grant.status != crate::GrantStatus::AuthorizationPending
-            || grant.current_revocation_id.is_some()
-        {
-            bail!("provider authorization can no longer be cancelled without revocation");
-        }
-        if self.grant_activation_operations()?.iter().any(|operation| {
-            operation.grant_id == grant_id && operation.state != GrantActivationState::Completed
-        }) {
-            bail!("provider authorization has entered credential custody and must be revoked");
-        }
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            let grant = self
+                .provider_grant(grant_id)?
+                .context("provider authorization reservation was not found")?;
+            if grant.status != crate::GrantStatus::AuthorizationPending
+                || grant.current_revocation_id.is_some()
+            {
+                bail!("provider authorization can no longer be cancelled without revocation");
+            }
+            if self.grant_activation_operations()?.iter().any(|operation| {
+                operation.grant_id == grant_id && operation.state != GrantActivationState::Completed
+            }) {
+                bail!("provider authorization has entered credential custody and must be revoked");
+            }
             self.delete_row("provider_grants", grant.id)?;
             self.release_provider_lifecycle(grant.connection_id, grant.id)?;
             self.receipt(
@@ -844,36 +1095,47 @@ impl Vault {
     /// preallocated because a conforming server may return a refresh token even
     /// when active refresh use is disabled by Cargo policy.
     pub fn begin_provider_token_exchange(&self, grant_id: Uuid) -> Result<()> {
-        let grant = self
-            .provider_grant(grant_id)?
-            .context("provider authorization reservation was not found")?;
-        if grant.status != crate::GrantStatus::AuthorizationPending {
-            bail!("provider authorization reservation is no longer pending");
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let grant = self
+                .provider_grant(grant_id)?
+                .context("provider authorization reservation was not found")?;
+            if grant.status != crate::GrantStatus::AuthorizationPending {
+                bail!("provider authorization reservation is no longer pending");
+            }
+            if self.grant_activation_operations()?.iter().any(|operation| {
+                operation.grant_id == grant_id && operation.state != GrantActivationState::Completed
+            }) {
+                bail!("provider token exchange was already started");
+            }
+            let operation = GrantActivationOperation {
+                id: Uuid::new_v4(),
+                grant_id,
+                access_secret_ref: grant.access_secret_ref.clone(),
+                refresh_secret_ref: Some(crate::oauth::new_secret_reference(grant.id, "refresh")?),
+                state: GrantActivationState::Staged,
+                created_at: Utc::now(),
+                completed_at: None,
+            };
+            self.put("grant_activations", operation.id, &operation)?;
+            self.receipt(
+                "provider_authorization.exchange_started",
+                &operation.id.to_string(),
+                "success",
+                "issuance-may-occur;credential-references-only",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        if self.grant_activation_operations()?.iter().any(|operation| {
-            operation.grant_id == grant_id && operation.state != GrantActivationState::Completed
-        }) {
-            bail!("provider token exchange was already started");
-        }
-        let operation = GrantActivationOperation {
-            id: Uuid::new_v4(),
-            grant_id,
-            access_secret_ref: grant.access_secret_ref.clone(),
-            refresh_secret_ref: Some(crate::oauth::new_secret_reference(grant.id, "refresh")?),
-            state: GrantActivationState::Staged,
-            created_at: Utc::now(),
-            completed_at: None,
-        };
-        let transaction = self.db.unchecked_transaction()?;
-        self.put("grant_activations", operation.id, &operation)?;
-        self.receipt(
-            "provider_authorization.exchange_started",
-            &operation.id.to_string(),
-            "success",
-            "issuance-may-occur;credential-references-only",
-        )?;
-        transaction.commit()?;
-        Ok(())
     }
 
     /// Conservatively reconciles a token request whose outcome is ambiguous.
@@ -1496,6 +1758,7 @@ impl Vault {
             "memory",
             "receipts",
             "deployments",
+            "execution_grants",
             "provider_grants",
             "grant_activations",
             "revocations",
@@ -2367,6 +2630,7 @@ mod tests {
         let first_grant = make_pending(Uuid::new_v4());
         let second_grant = make_pending(Uuid::new_v4());
         first.reserve_provider_authorization(&first_grant).unwrap();
+        assert!(second.delete_connection(connection.id).is_err());
         assert!(
             second
                 .reserve_provider_authorization(&second_grant)
@@ -2380,6 +2644,236 @@ mod tests {
         second
             .cancel_provider_authorization(second_grant.id)
             .unwrap();
+        second.delete_connection(connection.id).unwrap();
+        assert!(first.reserve_provider_authorization(&first_grant).is_err());
+    }
+
+    fn environment_backed_stdio(name: &str) -> ConnectionDefinition {
+        ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some("/Applications/Example Tools/mcp-server".into()),
+            args: vec!["  exact whitespace  ".into(), "".into()],
+            url: None,
+            environment_keys: vec!["EXAMPLE_API_KEY".into()],
+            metadata: BTreeMap::from([("source".into(), "test".into())]),
+        }
+    }
+
+    #[test]
+    fn execution_grant_is_inert_encrypted_immutable_and_not_exported() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [51_u8; 32]).unwrap();
+        vault.create_profile("Broker foundation").unwrap();
+        let mut connection = environment_backed_stdio("immutable-tools");
+        vault.upsert_connection(&connection).unwrap();
+
+        let preview = vault
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        let grant = vault.reserve_execution_grant(preview).unwrap();
+        assert_eq!(grant.status, ExecutionGrantStatus::AwaitingCredentials);
+        assert_eq!(grant.snapshot.args, vec!["  exact whitespace  ", ""]);
+        assert_eq!(grant.required_credentials.len(), 1);
+        assert_eq!(
+            grant.required_credentials[0].status,
+            ExecutionCredentialStatus::Missing
+        );
+        assert!(!vault.raw_documents_contain("EXAMPLE_API_KEY").unwrap());
+        assert!(!vault.raw_documents_contain("exact whitespace").unwrap());
+
+        connection.command = Some("/Applications/Changed/server".into());
+        connection.args = vec!["changed".into()];
+        vault.upsert_connection(&connection).unwrap();
+        let reloaded = vault.execution_grant(grant.id).unwrap().unwrap();
+        assert_eq!(reloaded.snapshot, grant.snapshot);
+        assert_eq!(reloaded.snapshot_sha256, grant.snapshot_sha256);
+
+        let pack = vault.export_selected(&[connection.id], &[]).unwrap();
+        let json = serde_json::to_string(&pack).unwrap();
+        assert!(!json.contains("execution_grant"));
+        assert!(!json.contains(&grant.id.to_string()));
+        assert!(!json.contains(&grant.required_credentials[0].binding_id.to_string()));
+        assert!(vault.delete_connection(connection.id).is_err());
+        let cancelled = vault.cancel_execution_grant(grant.id, 0).unwrap();
+        assert_eq!(cancelled.status, ExecutionGrantStatus::Cancelled);
+        assert_eq!(cancelled.revision, 1);
+        assert!(vault.cancel_execution_grant(grant.id, 0).is_err());
+        vault.delete_connection(connection.id).unwrap();
+    }
+
+    #[test]
+    fn execution_preview_is_stale_safe_one_use_and_cross_process_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let first = Vault::open_with_key(&path, [52_u8; 32]).unwrap();
+        first.create_profile("Execution owner").unwrap();
+        let mut connection = environment_backed_stdio("owned-tools");
+        first.upsert_connection(&connection).unwrap();
+        let stale = first
+            .prepare_execution_grant(connection.id, "Claude Desktop")
+            .unwrap();
+        connection.args.push("changed-after-preview".into());
+        first.upsert_connection(&connection).unwrap();
+        assert!(first.reserve_execution_grant(stale).is_err());
+        assert!(first.execution_grants().unwrap().is_empty());
+
+        let second = Vault::open_with_key(&path, [52_u8; 32]).unwrap();
+        let first_preview = first
+            .prepare_execution_grant(connection.id, "Claude Desktop")
+            .unwrap();
+        let second_preview = second
+            .prepare_execution_grant(connection.id, "Claude Desktop")
+            .unwrap();
+        let reusable_id = first_preview.id();
+        let grant = first.reserve_execution_grant(first_preview).unwrap();
+        assert!(second.reserve_execution_grant(second_preview).is_err());
+        assert_eq!(second.execution_grants().unwrap().len(), 1);
+        first.cancel_execution_grant(grant.id, 0).unwrap();
+
+        // A different, newly reviewed intent may own the same connection and
+        // host after cancellation; the consumed preview ID remains permanent.
+        let replacement = second
+            .prepare_execution_grant(connection.id, "Claude Desktop")
+            .unwrap();
+        let replacement = second.reserve_execution_grant(replacement).unwrap();
+        assert_ne!(replacement.id, grant.id);
+        assert_eq!(second.execution_grants().unwrap().len(), 2);
+        let consumed: i64 = second
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM consumed_execution_previews WHERE preview_id=?1",
+                params![reusable_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn execution_grants_allow_distinct_hosts_but_reject_unsafe_reference_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [53_u8; 32]).unwrap();
+        vault.create_profile("Multiple hosts").unwrap();
+        let mut connection = environment_backed_stdio("multi-host-tools");
+        vault.upsert_connection(&connection).unwrap();
+        let cursor = vault
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        let codex = vault
+            .prepare_execution_grant(connection.id, "Codex")
+            .unwrap();
+        vault.reserve_execution_grant(cursor).unwrap();
+        vault.reserve_execution_grant(codex).unwrap();
+        assert_eq!(vault.execution_grants().unwrap().len(), 2);
+
+        connection.environment_keys = vec!["header:Authorization".into()];
+        connection.id = Uuid::new_v4();
+        connection.name = "unsupported-header".into();
+        vault.upsert_connection(&connection).unwrap();
+        assert!(
+            vault
+                .prepare_execution_grant(connection.id, "Cursor")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn execution_owner_corruption_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [54_u8; 32]).unwrap();
+        vault.create_profile("Owner integrity").unwrap();
+        let connection = environment_backed_stdio("integrity-tools");
+        vault.upsert_connection(&connection).unwrap();
+        let preview = vault
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        vault.reserve_execution_grant(preview).unwrap();
+        vault
+            .db
+            .execute(
+                "UPDATE execution_grant_owners SET grant_id=?1",
+                params![Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+        assert!(vault.execution_grants().is_err());
+        assert!(vault.delete_connection(connection.id).is_err());
+    }
+
+    #[test]
+    fn connection_delete_and_execution_reservation_are_serialized() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let first = Vault::open_with_key(&path, [55_u8; 32]).unwrap();
+        first.create_profile("Delete serialization").unwrap();
+        let connection = environment_backed_stdio("serialized-tools");
+        first.upsert_connection(&connection).unwrap();
+        let preview = first
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        let second = Vault::open_with_key(&path, [55_u8; 32]).unwrap();
+
+        // If reservation wins the write lock, deletion must observe and refuse
+        // the pending owner instead of deleting its source definition.
+        let grant = first.reserve_execution_grant(preview).unwrap();
+        assert!(second.delete_connection(connection.id).is_err());
+        assert!(second.connection(connection.id).unwrap().is_some());
+        assert_eq!(second.execution_grants().unwrap().len(), 1);
+        first.cancel_execution_grant(grant.id, 0).unwrap();
+
+        // If deletion wins, a preview prepared earlier cannot recreate a
+        // grant for the now-missing definition.
+        let stale = first
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        second.delete_connection(connection.id).unwrap();
+        assert!(first.reserve_execution_grant(stale).is_err());
+        assert!(first.connection(connection.id).unwrap().is_none());
+        assert!(
+            first
+                .execution_grants()
+                .unwrap()
+                .iter()
+                .all(|item| item.status.is_terminal())
+        );
+    }
+
+    #[test]
+    fn execution_preview_expiry_is_rechecked_after_waiting_for_write_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let first = Vault::open_with_key(&path, [56_u8; 32]).unwrap();
+        first.create_profile("Preview expiry").unwrap();
+        let connection = environment_backed_stdio("expiry-tools");
+        first.upsert_connection(&connection).unwrap();
+        let second = Vault::open_with_key(&path, [56_u8; 32]).unwrap();
+        let mut preview = second
+            .prepare_execution_grant(connection.id, "Cursor")
+            .unwrap();
+        preview.set_expires_at(Utc::now() + chrono::Duration::milliseconds(100));
+
+        first.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reservation = std::thread::spawn(move || second.reserve_execution_grant(preview));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        first.db.execute_batch("ROLLBACK").unwrap();
+        assert!(reservation.join().unwrap().is_err());
+        assert!(first.execution_grants().unwrap().is_empty());
+        let consumed: i64 = first
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM consumed_execution_previews",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let owners: i64 = first
+            .db
+            .query_row("SELECT COUNT(*) FROM execution_grant_owners", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((consumed, owners), (0, 0));
     }
 
     #[cfg(unix)]
