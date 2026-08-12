@@ -7,7 +7,7 @@ cd apps/desktop
 npm run desktop:build:preview
 ```
 
-The production job runs in the protected `production-release` GitHub Environment and refuses preview/prerelease tags. Its tag must be an annotated signature that GitHub verifies, use exact `vMAJOR.MINOR.PATCH` syntax, and match the Rust workspace, desktop package, and Tauri versions.
+The production job runs in the protected `production-release` GitHub Environment and refuses preview/prerelease tags. Its tag must be an annotated OpenPGP signature that GitHub verifies and that Cargo independently validates against a pinned maintainer fingerprint, use exact `vMAJOR.MINOR.PATCH` syntax, and match the Rust workspace, desktop package, and Tauri versions.
 
 ## Required GitHub Environment secrets
 
@@ -18,9 +18,10 @@ The production job runs in the protected `production-release` GitHub Environment
 - `APPLE_API_ISSUER`: App Store Connect API issuer
 - `APPLE_API_KEY`: App Store Connect API key identifier
 - `APPLE_API_KEY_CONTENT`: one-time-downloaded P8 private-key contents
-- `RELEASE_SIGNER_LOGIN`: the single GitHub login allowed to sign production tags
+- `RELEASE_SIGNER_LOGIN`: the GitHub login whose published OpenPGP keys may sign production tags
+- `RELEASE_SIGNER_FINGERPRINT`: the full uppercase fingerprint of the one OpenPGP primary or signing key authorized for production
 
-The workflow generates its temporary keychain password, writes credentials only under `RUNNER_TEMP`, and removes the keychain, certificate, and P8 in an unconditional cleanup step. Repository patterns reject common certificate/private-key artifacts. Protect `v*` tags and require an independent reviewer on the `production-release` environment in GitHub settings; the workflow also rejects any verified signature whose signer login is not the allowlisted value.
+The workflow generates its temporary keychain password, writes credentials only under `RUNNER_TEMP`, imports the allowlisted signer’s public keys into an ephemeral GnuPG home, and removes all temporary keychain and verification material in an unconditional cleanup step. Repository patterns reject common certificate/private-key artifacts. Protect `v*` tags and require an independent reviewer on the `production-release` environment in GitHub settings. The workflow requires both GitHub’s verification and a local `git verify-tag` result matching `RELEASE_SIGNER_FINGERPRINT`; a different key on the same GitHub account is rejected.
 
 ## Publication gates
 
