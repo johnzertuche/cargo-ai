@@ -8,9 +8,9 @@ The current release is a **private preview**. It is usable for a local profile, 
 
 - Accountless local profile protected by the operating-system keychain
 - SQLite vault with per-record XChaCha20-Poly1305 authenticated encryption
-- Discovery and credential-free import from documented Claude Desktop, Cursor, and Codex configuration locations
+- Discovery and import from documented Claude Desktop, Cursor, and Codex configuration locations, with known credential fields removed
 - Typed local memory with sensitivity and allowed-host metadata
-- Credential-free JSON portable packs with explicit per-record export selection
+- JSON portable packs with explicit per-record export selection and exact value review
 - Passphrase-encrypted `age` portable packs with previewed, transactional, idempotent merge
 - First-run encrypted-pack restore that adopts the exported profile and selected portable content on an empty vault
 - Two-phase install flow for Claude Desktop/Cursor JSON and the official Codex/Claude Code CLIs: exact executable preview, explicit approval, verification, receipt
@@ -22,7 +22,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 
 ## Explicit limits
 
-- Import discards credential values. A destination must be authorized through its own secure flow.
+- Import discards known credential fields. Arbitrary configuration may still be sensitive and must be reviewed. A destination must be authorized through its own secure flow.
 - Claude remote connectors are managed by Claude's native Connectors UI, not its local JSON configuration.
 - Codex and Claude Code registration uses their official `mcp` CLIs with user-visible arguments, a minimal environment, and post-command registration verification.
 - Removing a host registration does not revoke an upstream provider token that another app copied.

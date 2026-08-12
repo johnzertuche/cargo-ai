@@ -1,6 +1,6 @@
 # Security policy and threat model
 
-Cargo is a private preview. Please do not use it as the sole custodian of irreplaceable production credentials. Connection imports intentionally discard credential values.
+Cargo is a private preview. Please do not use it as the sole custodian of irreplaceable production credentials. Connection imports discard known credential fields; arbitrary configuration can still be sensitive and requires review.
 
 ## Reporting
 
@@ -10,11 +10,11 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 
 - Local profile, connection, memory, deployment, and receipt records are encrypted at rest with authenticated per-record encryption.
 - The vault key is stored through the platform credential store, not in SQLite or portable packs.
-- Imported JSON/TOML definitions do not retain credential values.
+- Imported JSON/TOML definitions remove known credential fields and are treated as potentially sensitive untrusted configuration.
 - The privileged desktop backend does not load remote web content and the renderer has no generic shell/filesystem capability.
 - JSON host writes require an exact executable preview, reject stale plans, atomically replace after a second fingerprint check, preserve unrelated fields, and verify the owned fragment without retaining plaintext host-file backups.
 - Removal refuses a changed owned fragment rather than silently erasing user edits.
-- Portable packs contain explicitly selected personal data but no imported credential values. Optional passphrase protection uses the published `age` format; it is not full-vault recovery.
+- Portable packs contain only explicitly selected personal data. Known credential fields are removed, but scanners cannot prove arbitrary configuration is secret-free; every value must be reviewed. Optional passphrase protection uses the published `age` format; it is not full-vault recovery.
 - Receipts are hash-chained. The current check detects modification and ordering breaks in the records present, but cannot independently prove the newest tail was not deleted.
 
 ## Threats considered

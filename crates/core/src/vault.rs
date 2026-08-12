@@ -275,6 +275,40 @@ impl Vault {
         Ok(())
     }
 
+    /// Creates a user-authored portable definition after applying the same
+    /// sanitization boundary used for imported and exported definitions.
+    pub fn create_connection(&self, item: &ConnectionDefinition) -> Result<ConnectionDefinition> {
+        let item = crate::adapters::sanitize_manual_connection_definition(item)?;
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            if self
+                .connections()?
+                .iter()
+                .any(|existing| existing.name == item.name)
+            {
+                bail!("a connection with this name already exists");
+            }
+            self.put("connections", item.id, &item)?;
+            self.receipt(
+                "connection.created",
+                &item.id.to_string(),
+                "success",
+                &item.name,
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(item)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub fn merge_imported_connections(&self, items: &[ConnectionDefinition]) -> Result<usize> {
         let transaction = self.db.unchecked_transaction()?;
         let mut existing = self.connections()?;
@@ -1610,6 +1644,181 @@ mod tests {
         assert!(actions.contains(&"memory.updated".into()));
         assert!(actions.contains(&"memory.deleted".into()));
         assert!(vault.verify_receipt_chain().unwrap());
+    }
+
+    #[test]
+    fn manual_connection_creation_is_validated_and_receipted() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [49_u8; 32]).unwrap();
+        vault.create_profile("Manual connection").unwrap();
+        let definition = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "manual-remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: BTreeMap::from([
+                ("source".into(), "manual".into()),
+                ("source_path".into(), "/Users/example/private".into()),
+            ]),
+        };
+
+        let created = vault.create_connection(&definition).unwrap();
+        assert_eq!(created.url.as_deref(), Some("https://mcp.example/resource"));
+        assert!(created.environment_keys.is_empty());
+        assert!(!created.metadata.contains_key("source_path"));
+        assert_eq!(vault.connections().unwrap(), vec![created]);
+        assert!(
+            vault
+                .receipts()
+                .unwrap()
+                .iter()
+                .any(|receipt| receipt.action == "connection.created")
+        );
+    }
+
+    #[test]
+    fn manual_connection_creation_rejects_invalid_definitions_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [50_u8; 32]).unwrap();
+        vault.create_profile("Invalid connection").unwrap();
+        let invalid = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "--scope".into(),
+            transport: "stdio".into(),
+            command: Some("   ".into()),
+            args: vec![],
+            url: None,
+            environment_keys: vec![],
+            metadata: BTreeMap::from([("source".into(), "manual".into())]),
+        };
+        assert!(vault.create_connection(&invalid).is_err());
+
+        let insecure = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "insecure".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("http://example.com/mcp".into()),
+            environment_keys: vec![],
+            metadata: BTreeMap::from([("source".into(), "manual".into())]),
+        };
+        assert!(vault.create_connection(&insecure).is_err());
+
+        for (name, command, args, url) in [
+            (
+                "signed-url",
+                None,
+                vec![],
+                Some("https://mcp.example/mcp?X-Amz-Signature=opaquecredential".into()),
+            ),
+            (
+                "header-secret",
+                Some("mcp-server".into()),
+                vec![
+                    "--header".into(),
+                    "Authorization: Bearer opaquecredential".into(),
+                ],
+                None,
+            ),
+            (
+                "credential-flag",
+                Some("mcp-server".into()),
+                vec!["--credential".into(), "opaquecredential".into()],
+                None,
+            ),
+            (
+                "secret-command",
+                Some("sk-opaquecredential".into()),
+                vec![],
+                None,
+            ),
+            (
+                "private-inline-url",
+                Some("mcp-server".into()),
+                vec!["--endpoint=https://example.test/mcp?sig=opaquecredential".into()],
+                None,
+            ),
+            (
+                "cookie-secret",
+                Some("mcp-server".into()),
+                vec!["--cookie".into(), "session=opaquecredential".into()],
+                None,
+            ),
+        ] {
+            let transport = if command.is_some() {
+                "stdio"
+            } else {
+                "streamable_http"
+            };
+            let secret_bearing = ConnectionDefinition {
+                id: Uuid::new_v4(),
+                name: name.into(),
+                transport: transport.into(),
+                command,
+                args,
+                url,
+                environment_keys: vec![],
+                metadata: BTreeMap::from([("source".into(), "manual".into())]),
+            };
+            assert!(vault.create_connection(&secret_bearing).is_err());
+        }
+        assert!(vault.connections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_stdio_preserves_exact_nonsecret_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [52_u8; 32]).unwrap();
+        vault.create_profile("Exact arguments").unwrap();
+        let definition = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "manual-stdio".into(),
+            transport: "stdio".into(),
+            command: Some(" /usr/local/bin/mcp-server ".into()),
+            args: vec![
+                "  spaced value  ".into(),
+                "".into(),
+                "--read-only".into(),
+                "--endpoint=https://example.test/mcp".into(),
+            ],
+            url: None,
+            environment_keys: vec![],
+            metadata: BTreeMap::from([("source".into(), "manual".into())]),
+        };
+
+        let created = vault.create_connection(&definition).unwrap();
+        assert_eq!(
+            created.command.as_deref(),
+            Some("/usr/local/bin/mcp-server")
+        );
+        assert_eq!(created.args, definition.args);
+    }
+
+    #[test]
+    fn separate_vault_handles_cannot_create_duplicate_connection_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let first = Vault::open_with_key(&path, [51_u8; 32]).unwrap();
+        first.create_profile("Connection race").unwrap();
+        let second = Vault::open_with_key(&path, [51_u8; 32]).unwrap();
+        let make_definition = || ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "unique-name".into(),
+            transport: "stdio".into(),
+            command: Some("/usr/bin/true".into()),
+            args: vec![],
+            url: None,
+            environment_keys: vec![],
+            metadata: BTreeMap::from([("source".into(), "manual".into())]),
+        };
+
+        first.create_connection(&make_definition()).unwrap();
+        assert!(second.create_connection(&make_definition()).is_err());
+        assert_eq!(second.connection_count().unwrap(), 1);
     }
 
     #[test]

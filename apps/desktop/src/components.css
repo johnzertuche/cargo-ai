@@ -4,6 +4,9 @@
 .notice button { border: 0; background: none; color: inherit; font-size: 18px; cursor: pointer; }
 
 .connection-list, .deployment-list { display: grid; gap: 12px; margin: 22px 0 34px; }
+.connection-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
+.connection-heading > div { min-width: 0; }
+.connection-heading > button { flex: 0 0 auto; min-height: 42px; padding: 0 15px; border: 1px solid #253126; border-radius: 9px; background: #253126; color: #fff; cursor: pointer; font-weight: 750; }
 .connection-list > article { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(260px, auto); gap: 24px; align-items: center; padding: 22px; border: 1px solid #dde2dc; border-radius: 14px; background: #fff; }
 .connection-list span, .subheading > span { color: #718071; font-size: 11px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
 .connection-list h2 { margin: 6px 0; font-size: 21px; }
@@ -47,7 +50,17 @@
 .modal dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 .modal ul { padding-left: 20px; color: #59635a; font-size: 13px; line-height: 1.5; }
 .modal label { display: grid; gap: 7px; margin: 14px 0; color: #4b564d; font-size: 12px; font-weight: 750; }
-.modal input { min-height: 44px; padding: 0 12px; border: 1px solid #cbd4ca; border-radius: 9px; background: #fff; font-size: 16px; }
+.modal input, .modal select, .modal textarea { box-sizing: border-box; width: 100%; min-height: 44px; padding: 0 12px; border: 1px solid #cbd4ca; border-radius: 9px; background: #fff; color: #202920; font-size: 16px; }
+.modal textarea { min-height: 112px; padding-block: 10px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.45; }
+.field-help { display: block; margin-top: -8px; color: #69736a; font-size: 12px; line-height: 1.45; }
+.modal-error { margin: 14px 0 4px; }
+.argument-editor { display: grid; gap: 9px; margin: 16px 0; padding: 14px; border: 1px solid #d9dfd8; border-radius: 9px; }
+.argument-editor legend { padding: 0 6px; color: #667066; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+.argument-editor > p { margin: 0; font-size: 12px; }
+.argument-editor > div { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 8px; }
+.argument-editor label { margin: 0; }
+.argument-editor button { min-height: 42px; padding: 0 12px; border: 1px solid #ccd4cb; border-radius: 8px; background: #f7f9f6; color: #38423a; cursor: pointer; font-weight: 700; }
+.argument-editor > button { justify-self: start; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 22px; }
 .modal-actions button { min-height: 42px; padding: 0 15px; border: 1px solid #253126; border-radius: 9px; background: #253126; color: #fff; cursor: pointer; font-weight: 750; }
 .modal-actions button.secondary { border-color: #ccd4cb; background: #f7f9f6; color: #38423a; }
@@ -176,6 +189,8 @@
   .hosts article > button, .hosts article > span { grid-column: 2; justify-self: start; }
   .receipts article { grid-template-columns: 1fr; gap: 6px; }
   .connection-list > article, .memory-editor, .memory-list article { padding: 18px; }
+  .connection-heading { align-items: stretch; flex-direction: column; }
+  .connection-heading > button { align-self: flex-start; }
   .connection-actions { justify-content: stretch; }
   .connection-actions button { flex: 1 1 140px; min-height: 42px; }
   .record-actions { min-width: 0; }

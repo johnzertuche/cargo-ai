@@ -240,6 +240,13 @@ pub fn sanitize_connection_definition(
     if definition.command.is_some() == definition.url.is_some() {
         bail!("connection must contain exactly one of command or url");
     }
+    if definition
+        .command
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("stdio connection command cannot be empty");
+    }
     if definition.args.len() > 128 || definition.environment_keys.len() > 128 {
         bail!("connection contains too many arguments or credential references");
     }
@@ -266,7 +273,7 @@ pub fn sanitize_connection_definition(
             discovered.append(&mut refs);
             url
         });
-    let command = definition.command.clone();
+    let command = definition.command.as_ref().map(|value| value.trim().into());
     let expected_transport = if command.is_some() {
         "stdio"
     } else {
@@ -307,6 +314,68 @@ pub fn sanitize_connection_definition(
         environment_keys,
         metadata,
     })
+}
+
+/// Applies a deliberately narrower grammar to definitions typed directly by
+/// a user. Manual entry has no provider schema that could reliably distinguish
+/// configuration from credentials, so ambiguous secret-bearing forms fail
+/// closed instead of relying only on heuristic redaction.
+pub fn sanitize_manual_connection_definition(
+    definition: &ConnectionDefinition,
+) -> Result<ConnectionDefinition> {
+    let sanitized = sanitize_connection_definition(definition)?;
+    if sanitized.environment_keys != definition.environment_keys
+        || sanitized.args != definition.args
+    {
+        bail!(
+            "manual definitions cannot contain secret-shaped values; add credentials through a dedicated authorization flow"
+        );
+    }
+    if let Some(raw_url) = definition.url.as_deref() {
+        let url = Url::parse(raw_url).context("invalid MCP URL")?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!(
+                "manual remote URLs cannot contain user information, query parameters, or fragments"
+            );
+        }
+    }
+    if let Some(command) = sanitized.command.as_deref() {
+        let normalized = command.to_ascii_lowercase();
+        if command.chars().any(char::is_control)
+            || command.contains("://")
+            || looks_like_token(command)
+            || normalized.contains("authorization:")
+        {
+            bail!("manual stdio commands must be plain executable names or paths");
+        }
+    }
+    for argument in &definition.args {
+        if argument.chars().any(char::is_control)
+            || is_manual_credential_argument(argument)
+            || argument.to_ascii_lowercase().contains("authorization:")
+        {
+            bail!(
+                "manual stdio arguments cannot contain header, environment, credential, or secret injection forms"
+            );
+        }
+        let url_values = std::iter::once(argument.as_str())
+            .chain(argument.split_once('=').map(|(_, value)| value));
+        for value in url_values {
+            if let Ok(url) = Url::parse(value)
+                && (!url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some())
+            {
+                bail!("manual stdio URL arguments cannot contain private URL components");
+            }
+        }
+    }
+    Ok(sanitized)
 }
 
 pub fn validate_server_identifier(name: &str) -> Result<()> {
@@ -490,6 +559,52 @@ fn looks_like_token(value: &str) -> bool {
         || value.starts_with("sk-")
         || value.starts_with("ghp_")
         || value.starts_with("github_pat_")
+}
+
+fn is_manual_credential_argument(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if looks_like_token(value) {
+        return true;
+    }
+    let key = lower.split_once('=').map_or(lower.as_str(), |(key, _)| key);
+    let pieces: Vec<&str> = key
+        .trim_start_matches('-')
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|piece| !piece.is_empty())
+        .collect();
+    if pieces.iter().any(|piece| {
+        matches!(
+            *piece,
+            "authorization"
+                | "auth"
+                | "bearer"
+                | "credential"
+                | "credentials"
+                | "cookie"
+                | "cookies"
+                | "certificate"
+                | "cert"
+                | "env"
+                | "environment"
+                | "header"
+                | "headers"
+                | "key"
+                | "password"
+                | "passwd"
+                | "session"
+                | "sessionid"
+                | "secret"
+                | "token"
+        )
+    }) {
+        return true;
+    }
+    let assignment_key = value.split_once('=').map(|(key, _)| key).unwrap_or("");
+    !assignment_key.is_empty()
+        && assignment_key
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && assignment_key.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]

@@ -932,6 +932,44 @@ fn delete_connection_definition(
         .map_err(err)
 }
 
+#[tauri::command]
+fn create_connection_definition(
+    name: String,
+    transport: String,
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    app: State<AppRuntime>,
+) -> Result<ConnectionDefinition, String> {
+    let definition = match transport.as_str() {
+        "stdio" => ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name,
+            transport,
+            command: command.map(|value| value.trim().to_owned()),
+            args,
+            url: None,
+            environment_keys: vec![],
+            metadata: std::collections::BTreeMap::from([("source".into(), "manual".into())]),
+        },
+        "streamable_http" => ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name,
+            transport,
+            command: None,
+            args: vec![],
+            url: url.map(|value| value.trim().to_owned()),
+            environment_keys: vec![],
+            metadata: std::collections::BTreeMap::from([("source".into(), "manual".into())]),
+        },
+        _ => return Err("Transport must be stdio or streamable_http".into()),
+    };
+    let session = active_vault(&app)?;
+    vault_ref(&session)?
+        .create_connection(&definition)
+        .map_err(err)
+}
+
 fn parse_sensitivity(value: &str) -> Result<Sensitivity, String> {
     match value {
         "public" => Ok(Sensitivity::Public),
@@ -1082,6 +1120,7 @@ pub fn run() {
             add_memory_record,
             update_memory_record,
             delete_memory_record,
+            create_connection_definition,
             delete_connection_definition,
             plan_connection_install,
             apply_connection_install,
