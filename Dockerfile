@@ -6,6 +6,8 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY app ./app
+COPY .openai ./.openai
+COPY build ./build
 COPY public ./public
 COPY next-env.d.ts next.config.ts postcss.config.mjs tsconfig.json vite.config.ts ./
 RUN npm run build
