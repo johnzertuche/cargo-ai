@@ -2,7 +2,7 @@
 
 Cargo is a public native OAuth client. It never embeds or claims a confidential client secret. A remote MCP server is connectable only when it supports a preconfigured public client, Client ID Metadata Document, Dynamic Client Registration, or an explicitly supplied public client registration.
 
-The current implementation is the non-networked security core. It validates and tests metadata, PKCE, state, resource binding, encrypted grant persistence, and revocation transitions. It does not yet launch a browser, receive callbacks, exchange or store live tokens, or advertise compatibility with a named provider.
+The current implementation includes the security core, a bounded Rust HTTP transport, an exact one-shot native loopback callback receiver, and an in-process OAuth/MCP conformance provider used only by tests. It validates and tests metadata, PKCE, state, resource binding, encrypted grant persistence, refresh rotation/replay, and revocation transitions. The desktop and CLI do not yet launch the user’s browser, expose provider connection controls, persist live tokens, or advertise compatibility with a named provider.
 
 ## Discovery and authorization invariants
 
@@ -15,7 +15,7 @@ The current implementation is the non-networked security core. It validates and 
 - State and PKCE verifier values use 256 bits of operating-system randomness. State is one-shot and compared through a fixed-size digest without an early exit.
 - Authorization transactions are non-serializable, redact secrets from `Debug`, and zeroize state/verifier buffers on drop.
 
-Network discovery must additionally implement response/time/redirect caps, DNS rebinding protection, private/link-local address rejection, exact discovery fallback order, and browser/callback isolation before it can be enabled.
+Network discovery uses response/time caps, zero redirects, recursive duplicate-key rejection, proxy bypass, conservative public-address validation, and per-request pinned DNS resolution. Additional discovery fallback variants and real-provider conformance remain release gates before the desktop or CLI enables live authorization.
 
 ## Token boundary
 

@@ -314,6 +314,10 @@ impl AuthorizationTransaction {
         url
     }
 
+    pub fn redirect_uri(&self) -> &Url {
+        &self.redirect_uri
+    }
+
     pub fn consume_callback(&mut self, returned_state: &str) -> Result<()> {
         self.consume_callback_at(returned_state, chrono::Utc::now())
     }
@@ -366,6 +370,7 @@ impl AuthorizationTransaction {
             client_id: self.client_id.clone(),
             redirect_uri: self.redirect_uri.clone(),
             resource: self.resource.clone(),
+            requested_scopes: self.requested_scopes.clone(),
         })
     }
 
@@ -382,6 +387,7 @@ pub struct TokenExchangeRequest {
     client_id: String,
     redirect_uri: Url,
     resource: Url,
+    requested_scopes: Vec<String>,
 }
 
 pub struct IssuedTokens {
@@ -443,7 +449,12 @@ pub enum TokenKind {
 /// must cap and redact all provider diagnostics before converting them to errors.
 pub trait OAuthProviderTransport {
     fn exchange(&mut self, request: TokenExchangeRequest) -> Result<IssuedTokens>;
-    fn refresh(&mut self, refresh_token: &SecretString, resource: &Url) -> Result<IssuedTokens>;
+    fn refresh(
+        &mut self,
+        refresh_token: &SecretString,
+        resource: &Url,
+        granted_scopes: &[String],
+    ) -> Result<IssuedTokens>;
     fn revoke(&mut self, token: &SecretString, kind: TokenKind) -> Result<TokenRevocationResult>;
     fn probe_resource(
         &self,
@@ -461,11 +472,16 @@ impl fmt::Debug for TokenExchangeRequest {
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
             .field("resource", &self.resource)
+            .field("requested_scopes", &self.requested_scopes)
             .finish()
     }
 }
 
 impl TokenExchangeRequest {
+    pub fn requested_scopes(&self) -> &[String] {
+        &self.requested_scopes
+    }
+
     pub fn into_form_body(mut self) -> SecretFormBody {
         let pairs = [
             ("grant_type", "authorization_code"),
@@ -844,6 +860,7 @@ mod tests {
             &mut self,
             refresh_token: &SecretString,
             resource: &Url,
+            _granted_scopes: &[String],
         ) -> Result<IssuedTokens> {
             if resource != &self.resource {
                 bail!("refresh resource did not match");
@@ -1196,10 +1213,16 @@ mod tests {
             RevocationVerification::StillActive
         );
 
-        let rotated = provider.refresh(&refresh, &metadata.resource).unwrap();
+        let rotated = provider
+            .refresh(&refresh, &metadata.resource, &["read".into()])
+            .unwrap();
         let (rotated_access, rotated_refresh) = rotated.into_secrets();
         let rotated_refresh = rotated_refresh.unwrap();
-        assert!(provider.refresh(&refresh, &metadata.resource).is_err());
+        assert!(
+            provider
+                .refresh(&refresh, &metadata.resource, &["read".into()])
+                .is_err()
+        );
         assert_eq!(
             provider
                 .probe_resource(&rotated_access, &metadata.resource)
