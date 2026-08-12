@@ -191,13 +191,16 @@ pub fn revoke_json_deployment(deployment: &ManagedDeployment) -> Result<ManagedD
         bail!("configuration exceeds 4 MiB limit");
     }
     let mut root: Value = serde_json::from_slice(&before)?;
-    let servers = root
-        .get_mut("mcpServers")
-        .and_then(Value::as_object_mut)
-        .context("host configuration no longer contains mcpServers")?;
-    let current = servers
-        .get(&deployment.server_name)
-        .context("managed MCP server entry is already absent")?;
+    let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        let mut removed = deployment.clone();
+        removed.state = DeploymentState::HostRemoved;
+        return Ok(removed);
+    };
+    let Some(current) = servers.get(&deployment.server_name) else {
+        let mut removed = deployment.clone();
+        removed.state = DeploymentState::HostRemoved;
+        return Ok(removed);
+    };
     if sha256(&serde_json::to_vec(current)?) != deployment.installed_fragment_sha256 {
         bail!("managed entry changed after installation; refusing to remove user edits");
     }
@@ -434,6 +437,9 @@ mod tests {
         assert_eq!(final_value["theme"], "light");
         assert_eq!(final_value["mcpServers"]["existing"]["command"], "keep-me");
         assert!(final_value["mcpServers"].get("docs").is_none());
+
+        let retried = revoke_json_deployment(&deployment).unwrap();
+        assert_eq!(retried.state, DeploymentState::HostRemoved);
     }
 
     #[test]

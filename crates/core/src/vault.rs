@@ -1,6 +1,6 @@
 use crate::{
-    AuditReceipt, ConnectionDefinition, LocalProfile, ManagedDeployment, MemoryRecord,
-    PackImportResult, PortablePack,
+    AuditReceipt, ConnectionDefinition, DeploymentState, LocalProfile, ManagedDeployment,
+    MemoryRecord, PackImportResult, PortablePack,
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
@@ -199,9 +199,7 @@ impl Vault {
     }
 
     pub fn create_profile(&self, display_name: &str) -> Result<LocalProfile> {
-        if display_name.trim().is_empty() {
-            bail!("display name cannot be empty");
-        }
+        validate_display_name(display_name)?;
         if self.profile()?.is_some() {
             bail!("a local profile already exists");
         }
@@ -210,6 +208,7 @@ impl Vault {
             display_name: display_name.trim().into(),
             created_at: Utc::now(),
         };
+        let transaction = self.db.unchecked_transaction()?;
         self.put("profile", profile.id, &profile)?;
         self.receipt(
             "profile.created",
@@ -217,6 +216,23 @@ impl Vault {
             "success",
             &profile.display_name,
         )?;
+        transaction.commit()?;
+        Ok(profile)
+    }
+
+    pub fn rename_profile(&self, display_name: &str) -> Result<LocalProfile> {
+        validate_display_name(display_name)?;
+        let mut profile = self.profile()?.context("local profile was not found")?;
+        profile.display_name = display_name.trim().into();
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("profile", profile.id, &profile)?;
+        self.receipt(
+            "profile.renamed",
+            &profile.id.to_string(),
+            "success",
+            &profile.display_name,
+        )?;
+        transaction.commit()?;
         Ok(profile)
     }
 
@@ -225,6 +241,7 @@ impl Vault {
     }
 
     pub fn upsert_connection(&self, item: &ConnectionDefinition) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
         self.put("connections", item.id, item)?;
         self.receipt(
             "connection.saved",
@@ -232,7 +249,33 @@ impl Vault {
             "success",
             &item.name,
         )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn merge_imported_connections(&self, items: &[ConnectionDefinition]) -> Result<usize> {
+        let transaction = self.db.unchecked_transaction()?;
+        let mut existing = self.connections()?;
+        for item in items {
+            let source_path = item.metadata.get("source_path");
+            let mut saved = item.clone();
+            if let Some(previous) = existing.iter().find(|candidate| {
+                candidate.name == item.name && candidate.metadata.get("source_path") == source_path
+            }) {
+                saved.id = previous.id;
+            } else {
+                existing.push(saved.clone());
+            }
+            self.put("connections", saved.id, &saved)?;
+            self.receipt(
+                "connection.saved",
+                &saved.id.to_string(),
+                "success",
+                &saved.name,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(items.len())
     }
 
     pub fn merge_imported_connection(&self, item: &ConnectionDefinition) -> Result<bool> {
@@ -251,8 +294,59 @@ impl Vault {
     }
 
     pub fn add_memory(&self, item: &MemoryRecord) -> Result<()> {
+        validate_memory(item)?;
+        let transaction = self.db.unchecked_transaction()?;
         self.put("memory", item.id, item)?;
         self.receipt("memory.saved", &item.id.to_string(), "success", &item.title)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_memory(&self, item: &MemoryRecord) -> Result<()> {
+        validate_memory(item)?;
+        if self.memory_record(item.id)?.is_none() {
+            bail!("memory record was not found");
+        }
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("memory", item.id, item)?;
+        self.receipt(
+            "memory.updated",
+            &item.id.to_string(),
+            "success",
+            &item.title,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_memory(&self, id: Uuid) -> Result<()> {
+        let memory = self
+            .memory_record(id)?
+            .context("memory record was not found")?;
+        let transaction = self.db.unchecked_transaction()?;
+        self.delete_row("memory", id)?;
+        self.receipt("memory.deleted", &id.to_string(), "success", &memory.title)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_connection(&self, id: Uuid) -> Result<()> {
+        let connection = self.connection(id)?.context("connection was not found")?;
+        let is_managed = self.deployments()?.iter().any(|deployment| {
+            deployment.connection_id == id && deployment.state != DeploymentState::HostRemoved
+        });
+        if is_managed {
+            bail!("remove every active managed host deployment before deleting this connection");
+        }
+        let transaction = self.db.unchecked_transaction()?;
+        self.delete_row("connections", id)?;
+        self.receipt(
+            "connection.deleted",
+            &id.to_string(),
+            "success",
+            &connection.name,
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -280,11 +374,20 @@ impl Vault {
     pub fn connections(&self) -> Result<Vec<ConnectionDefinition>> {
         self.all("connections", false)
     }
+    pub fn connection_count(&self) -> Result<usize> {
+        self.count("connections")
+    }
     pub fn connection(&self, id: Uuid) -> Result<Option<ConnectionDefinition>> {
         self.by_id("connections", id)
     }
     pub fn memory(&self) -> Result<Vec<MemoryRecord>> {
         self.all("memory", false)
+    }
+    pub fn memory_count(&self) -> Result<usize> {
+        self.count("memory")
+    }
+    pub fn memory_record(&self, id: Uuid) -> Result<Option<MemoryRecord>> {
+        self.by_id("memory", id)
     }
     pub fn receipts(&self) -> Result<Vec<AuditReceipt>> {
         self.all("receipts", true)
@@ -298,13 +401,16 @@ impl Vault {
     }
 
     pub fn save_deployment(&self, deployment: &ManagedDeployment) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
         self.put("deployments", deployment.id, deployment)?;
         self.receipt(
             "deployment.state",
             &deployment.id.to_string(),
             "success",
             &format!("{}:{:?}", deployment.host, deployment.state),
-        )
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn by_id<T: serde::de::DeserializeOwned>(&self, table: &str, id: Uuid) -> Result<Option<T>> {
@@ -320,6 +426,26 @@ impl Vault {
             )?)
         })
         .transpose()
+    }
+
+    fn delete_row(&self, table: &str, id: Uuid) -> Result<()> {
+        let affected = self.db.execute(
+            &format!("DELETE FROM {table} WHERE id=?1"),
+            params![id.to_string()],
+        )?;
+        if affected != 1 {
+            bail!("record was not found");
+        }
+        Ok(())
+    }
+
+    fn count(&self, table: &str) -> Result<usize> {
+        let count: i64 =
+            self.db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+        usize::try_from(count).context("record count was invalid")
     }
 
     fn all<T: serde::de::DeserializeOwned>(&self, table: &str, descending: bool) -> Result<Vec<T>> {
@@ -547,6 +673,26 @@ impl Vault {
     }
 }
 
+fn validate_display_name(display_name: &str) -> Result<()> {
+    if display_name.trim().is_empty() || display_name.chars().count() > 200 {
+        bail!("display name must be between 1 and 200 characters");
+    }
+    Ok(())
+}
+
+fn validate_memory(memory: &MemoryRecord) -> Result<()> {
+    if memory.title.trim().is_empty()
+        || memory.title.chars().count() > 200
+        || memory.body.trim().is_empty()
+        || memory.body.len() > 256 * 1024
+        || memory.allowed_hosts.len() > 64
+        || memory.allowed_hosts.iter().any(|host| host.len() > 200)
+    {
+        bail!("memory record contains invalid or oversized fields");
+    }
+    Ok(())
+}
+
 pub fn validate_portable_pack(pack: &PortablePack) -> Result<PortablePack> {
     if pack.format != "cargo-ai-pack" || pack.version != 2 || pack.contains_secrets {
         bail!("unsupported portable pack format, version, or secret-content flag");
@@ -554,11 +700,8 @@ pub fn validate_portable_pack(pack: &PortablePack) -> Result<PortablePack> {
     if pack.connections.len() > 2_000 || pack.memory.len() > 10_000 {
         bail!("portable pack exceeds record-count limits");
     }
-    if pack.profile.display_name.trim().is_empty()
-        || pack.profile.display_name.chars().count() > 200
-    {
-        bail!("portable pack contains an invalid profile");
-    }
+    validate_display_name(&pack.profile.display_name)
+        .context("portable pack contains an invalid profile")?;
     let connections = pack
         .connections
         .iter()
@@ -576,15 +719,7 @@ pub fn validate_portable_pack(pack: &PortablePack) -> Result<PortablePack> {
         if !memory_ids.insert(memory.id) {
             bail!("portable pack contains duplicate memory IDs");
         }
-        if memory.title.trim().is_empty()
-            || memory.title.chars().count() > 200
-            || memory.body.trim().is_empty()
-            || memory.body.len() > 256 * 1024
-            || memory.allowed_hosts.len() > 64
-            || memory.allowed_hosts.iter().any(|host| host.len() > 200)
-        {
-            bail!("portable pack contains an invalid memory record");
-        }
+        validate_memory(memory).context("portable pack contains an invalid memory record")?;
     }
     let mut validated = pack.clone();
     validated.profile.display_name = validated.profile.display_name.trim().into();
@@ -640,6 +775,89 @@ mod tests {
         }
         let wrong = Vault::open_with_key(&path, [2; 32]);
         assert!(wrong.is_err() || wrong.unwrap().profile().is_err());
+    }
+
+    #[test]
+    fn profile_and_memory_lifecycle_is_receipted() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(dir.path().join("vault.db"), [12; 32]).unwrap();
+        let original = vault.create_profile("Ada").unwrap();
+        let renamed = vault.rename_profile("Ada Lovelace").unwrap();
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.created_at, original.created_at);
+
+        let mut memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "Working style".into(),
+            body: "Be concise".into(),
+            sensitivity: crate::Sensitivity::Private,
+            allowed_hosts: vec!["Codex".into()],
+            created_at: Utc::now(),
+        };
+        vault.add_memory(&memory).unwrap();
+        memory.body = "Be concise and surface tradeoffs".into();
+        vault.update_memory(&memory).unwrap();
+        assert_eq!(
+            vault.memory_record(memory.id).unwrap(),
+            Some(memory.clone())
+        );
+        vault.delete_memory(memory.id).unwrap();
+        assert!(vault.memory_record(memory.id).unwrap().is_none());
+        let actions = vault
+            .receipts()
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.action)
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"profile.renamed".into()));
+        assert!(actions.contains(&"memory.updated".into()));
+        assert!(actions.contains(&"memory.deleted".into()));
+        assert!(vault.verify_receipt_chain().unwrap());
+    }
+
+    #[test]
+    fn connection_delete_refuses_active_managed_deployment() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(dir.path().join("vault.db"), [13; 32]).unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "example".into(),
+            transport: "stdio".into(),
+            command: Some("example-mcp".into()),
+            args: vec![],
+            url: None,
+            environment_keys: vec![],
+            metadata: BTreeMap::new(),
+        };
+        vault.upsert_connection(&connection).unwrap();
+        let mut deployment = ManagedDeployment {
+            id: Uuid::new_v4(),
+            connection_id: connection.id,
+            host: "Cursor".into(),
+            server_name: "example".into(),
+            config_path: "/tmp/mcp.json".into(),
+            preimage_sha256: None,
+            installed_fragment_sha256: "abc".into(),
+            backup_path: None,
+            state: DeploymentState::Active,
+            installed_at: Utc::now(),
+        };
+        vault.save_deployment(&deployment).unwrap();
+        assert!(vault.delete_connection(connection.id).is_err());
+        for state in [
+            DeploymentState::LocalBlocked,
+            DeploymentState::Conflict,
+            DeploymentState::Failed,
+        ] {
+            deployment.state = state;
+            vault.save_deployment(&deployment).unwrap();
+            assert!(vault.delete_connection(connection.id).is_err());
+        }
+        deployment.state = DeploymentState::HostRemoved;
+        vault.save_deployment(&deployment).unwrap();
+        vault.delete_connection(connection.id).unwrap();
+        assert!(vault.connection(connection.id).unwrap().is_none());
+        assert!(vault.verify_receipt_chain().unwrap());
     }
 
     #[test]

@@ -46,8 +46,8 @@ pub fn discover_known(home: &Path) -> Vec<HostSnapshot> {
         }
     });
     let codex_config = home.join(".codex/config.toml");
-    let codex_cli = command_path("codex");
-    let claude_cli = command_path("claude");
+    let codex_cli = trusted_command_path(home, "codex");
+    let claude_cli = trusted_command_path(home, "claude");
     json_hosts
         .chain([
             HostSnapshot {
@@ -77,12 +77,12 @@ pub fn discover_known(home: &Path) -> Vec<HostSnapshot> {
         .collect()
 }
 
-fn command_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+fn trusted_command_path(home: &Path, name: &str) -> Option<PathBuf> {
+    home.join(".local/bin")
+        .join(name)
+        .canonicalize()
+        .ok()
+        .filter(|candidate| candidate.is_file())
 }
 
 pub fn read_json_config(path: &Path) -> Result<serde_json::Value> {

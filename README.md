@@ -29,7 +29,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 
 ## Desktop app
 
-The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.1) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
+The [Apple Silicon private-preview DMG](https://github.com/johnzertuche/cargo-ai/releases/tag/v0.1.0-preview.2) includes SHA-256 checksums and CycloneDX SBOMs. It is ad-hoc signed but not Apple-notarized, so install from source is recommended until the production signing gate is complete.
 
 Source prerequisites: macOS, Node.js 22+, and current stable Rust.
 
@@ -53,9 +53,15 @@ The app calls account creation **Create local profile** because no vendor accoun
 ```bash
 cargo run -p cargo-ai-cli -- init --name "Ada"
 cargo run -p cargo-ai-cli -- status
+cargo run -p cargo-ai-cli -- rename-profile --name "Ada Lovelace"
 cargo run -p cargo-ai-cli -- discover
 cargo run -p cargo-ai-cli -- connections
 printf 'Prefer concise updates' | cargo run -p cargo-ai-cli -- memory add --title "Working style"
+cargo run -p cargo-ai-cli -- memory list
+# Edit and delete use the UUIDs shown by the list commands:
+printf 'Prefer short, decisive updates' | cargo run -p cargo-ai-cli -- memory edit MEMORY_UUID --title "Working style"
+cargo run -p cargo-ai-cli -- memory delete MEMORY_UUID
+cargo run -p cargo-ai-cli -- delete-connection CONNECTION_UUID
 cargo run -p cargo-ai-cli -- export-safe cargo-ai-portable-pack.json
 cargo run -p cargo-ai-cli -- export-encrypted cargo-ai-portable-pack.age
 cargo run -p cargo-ai-cli -- import-encrypted cargo-ai-portable-pack.age

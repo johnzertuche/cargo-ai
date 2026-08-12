@@ -51,6 +51,7 @@ struct CliInstallPlan {
     host: String,
     server_name: String,
     executable: PathBuf,
+    executable_sha256: String,
     add_args: Vec<String>,
     get_args: Vec<String>,
     remove_args: Vec<String>,
@@ -74,6 +75,14 @@ struct ImportPreview {
 const IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 fn active_vault(app: &AppRuntime) -> Result<MutexGuard<'_, VaultSession>, String> {
+    app.plans
+        .lock()
+        .map_err(err)?
+        .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
+    app.imports
+        .lock()
+        .map_err(err)?
+        .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
     if let Some(error) = app.startup_error.lock().map_err(err)?.as_ref() {
         return Err(format!("Vault could not open: {error}"));
     }
@@ -96,9 +105,7 @@ fn vault_ref(session: &VaultSession) -> Result<&Vault, String> {
 struct AppState {
     profile: Option<LocalProfile>,
     hosts: Vec<HostSnapshot>,
-    connections: Vec<ConnectionDefinition>,
     deployments: Vec<ManagedDeployment>,
-    memory: Vec<MemoryRecord>,
     connection_count: usize,
     memory_count: usize,
     receipts: Vec<cargo_ai_core::AuditReceipt>,
@@ -112,20 +119,46 @@ fn home_dir() -> Result<PathBuf, String> {
         .ok_or("Home directory is unavailable".into())
 }
 fn state(vault: &Vault) -> Result<AppState, String> {
-    let connections = vault.connections().map_err(err)?;
-    let memory = vault.memory().map_err(err)?;
     Ok(AppState {
         profile: vault.profile().map_err(err)?,
         hosts: discover_known(&home_dir()?),
-        connection_count: connections.len(),
-        connections,
+        connection_count: vault.connection_count().map_err(err)?,
         deployments: vault.deployments().map_err(err)?,
-        memory_count: memory.len(),
-        memory,
+        memory_count: vault.memory_count().map_err(err)?,
         receipts: vault.receipts().map_err(err)?,
         receipt_chain_valid: vault.verify_receipt_chain().map_err(err)?,
         vault_path: vault.path().display().to_string(),
     })
+}
+
+#[tauri::command]
+fn memory_records(app: State<'_, AppRuntime>) -> Result<Vec<MemoryRecord>, String> {
+    let session = active_vault(&app)?;
+    vault_ref(&session)?.memory().map_err(err)
+}
+
+#[tauri::command]
+fn connection_records(app: State<'_, AppRuntime>) -> Result<Vec<ConnectionDefinition>, String> {
+    let session = active_vault(&app)?;
+    vault_ref(&session)?.connections().map_err(err)
+}
+
+#[tauri::command]
+fn touch_vault(app: State<'_, AppRuntime>) -> Result<(), String> {
+    active_vault(&app).map(|_| ())
+}
+
+#[tauri::command]
+fn purge_expired_previews(app: State<'_, AppRuntime>) -> Result<(), String> {
+    app.plans
+        .lock()
+        .map_err(err)?
+        .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
+    app.imports
+        .lock()
+        .map_err(err)?
+        .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(300));
+    Ok(())
 }
 
 fn read_transfer_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -227,6 +260,17 @@ fn create_local_profile(
         .create_profile(&display_name)
         .map_err(err)
 }
+
+#[tauri::command]
+fn rename_local_profile(
+    display_name: String,
+    app: State<AppRuntime>,
+) -> Result<LocalProfile, String> {
+    let session = active_vault(&app)?;
+    vault_ref(&session)?
+        .rename_profile(&display_name)
+        .map_err(err)
+}
 #[tauri::command]
 async fn export_safe_pack(
     connection_ids: Vec<String>,
@@ -306,10 +350,7 @@ fn import_host_configuration(host: String, app: State<AppRuntime>) -> Result<usi
     };
     let session = active_vault(&app)?;
     let vault = vault_ref(&session)?;
-    for definition in &definitions {
-        vault.merge_imported_connection(definition).map_err(err)?;
-    }
-    Ok(definitions.len())
+    vault.merge_imported_connections(&definitions).map_err(err)
 }
 
 fn official_command(executable: &Path, args: &[String]) -> Command {
@@ -323,6 +364,57 @@ fn official_command(executable: &Path, args: &[String]) -> Command {
         }
     }
     command
+}
+
+fn verify_official_executable(host: &str, executable: &Path) -> Result<String, String> {
+    let home = home_dir()?;
+    let canonical = executable.canonicalize().map_err(err)?;
+    let (trusted_root, team_id) = match host {
+        "Codex" => (
+            home.join(".codex/packages/standalone/releases"),
+            "2DC432GLL2",
+        ),
+        "Claude Code" => (home.join(".local/share/claude/versions"), "Q6L2SF6YDW"),
+        _ => return Err("Unsupported official CLI adapter".into()),
+    };
+    let trusted_root = trusted_root
+        .canonicalize()
+        .map_err(|_| format!("The trusted {host} installation directory could not be verified"))?;
+    if !canonical.starts_with(&trusted_root) || !canonical.is_file() {
+        return Err(format!(
+            "Refusing to execute {host}: its resolved binary is outside the trusted installation directory"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&canonical).map_err(err)?;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(format!(
+                "Refusing to execute a group/world-writable {host} binary"
+            ));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["-dv", "--verbose=2"])
+            .arg(&canonical)
+            .env_clear()
+            .output()
+            .map_err(err)?;
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            || !diagnostic
+                .lines()
+                .any(|line| line == format!("TeamIdentifier={team_id}"))
+        {
+            return Err(format!(
+                "Refusing to execute {host}: the macOS publisher signature did not match"
+            ));
+        }
+    }
+    cargo_ai_core::adapters::fingerprint(&canonical).map_err(err)
 }
 
 fn registration_exists(executable: &Path, args: &[String]) -> Result<bool, String> {
@@ -375,6 +467,10 @@ fn plan_cli_install(
         .command_path
         .clone()
         .ok_or("Official host CLI was not found")?;
+    #[cfg(not(test))]
+    let executable_sha256 = verify_official_executable(&snapshot.host, &executable)?;
+    #[cfg(test)]
+    let executable_sha256 = cargo_ai_core::adapters::fingerprint(&executable).map_err(err)?;
     let (add_args, get_args, remove_args) = match snapshot.host.as_str() {
         "Codex" => {
             let mut add = vec!["mcp".into(), "add".into(), connection.name.clone()];
@@ -438,6 +534,7 @@ fn plan_cli_install(
         host: snapshot.host.clone(),
         server_name: connection.name.clone(),
         executable: executable.clone(),
+        executable_sha256,
         add_args: add_args.clone(),
         get_args,
         remove_args,
@@ -452,7 +549,7 @@ fn plan_cli_install(
         preimage_sha256: None,
         result_sha256: id.as_simple().to_string().repeat(2),
         warnings: vec![
-            "Cargo will invoke the signed host CLI directly without a shell and with a minimal environment.".into(),
+            "Cargo verified the host CLI's trusted install location, publisher Team ID, and executable fingerprint. It will invoke that exact binary directly without a shell and with a minimal environment.".into(),
             "Registration removal and OAuth credential logout are separate operations; this install does not copy credential values.".into(),
         ],
         transport: connection.transport,
@@ -465,6 +562,13 @@ fn plan_cli_install(
 }
 
 fn apply_cli_plan(plan: CliInstallPlan) -> Result<ManagedDeployment, String> {
+    #[cfg(not(test))]
+    {
+        let current_sha256 = verify_official_executable(&plan.host, &plan.executable)?;
+        if current_sha256 != plan.executable_sha256 {
+            return Err("The verified host CLI changed after preview; create a new plan".into());
+        }
+    }
     run_official_cli(&plan.executable, &plan.add_args, "add the registration")?;
     if !registration_exists(&plan.executable, &plan.get_args)? {
         let rollback = run_official_cli(
@@ -488,7 +592,7 @@ fn apply_cli_plan(plan: CliInstallPlan) -> Result<ManagedDeployment, String> {
         server_name: plan.server_name,
         config_path: format!("cli://{}/user", plan.executable.display()),
         preimage_sha256: None,
-        installed_fragment_sha256: plan.id.as_simple().to_string().repeat(2),
+        installed_fragment_sha256: plan.executable_sha256,
         backup_path: None,
         state: cargo_ai_core::DeploymentState::Active,
         installed_at: Utc::now(),
@@ -496,13 +600,16 @@ fn apply_cli_plan(plan: CliInstallPlan) -> Result<ManagedDeployment, String> {
 }
 
 fn remove_cli_registration(deployment: &ManagedDeployment) -> Result<ManagedDeployment, String> {
-    let snapshot = discover_known(&home_dir()?)
-        .into_iter()
-        .find(|item| item.host == deployment.host)
-        .ok_or("Host adapter is unavailable")?;
-    let executable = snapshot
-        .command_path
-        .ok_or("Official host CLI is unavailable")?;
+    let raw_path = deployment
+        .config_path
+        .strip_prefix("cli://")
+        .and_then(|value| value.strip_suffix("/user"))
+        .ok_or("Managed CLI deployment does not contain a verified executable path")?;
+    let executable = PathBuf::from(raw_path);
+    let current_sha256 = verify_official_executable(&deployment.host, &executable)?;
+    if current_sha256 != deployment.installed_fragment_sha256 {
+        return Err("The verified host CLI changed since installation; preview removal again after reviewing the new binary".into());
+    }
     let (get_args, remove_args) = match deployment.host.as_str() {
         "Codex" => (
             vec![
@@ -622,29 +729,73 @@ fn add_memory_record(
     allowed_hosts: Vec<String>,
     app: State<AppRuntime>,
 ) -> Result<MemoryRecord, String> {
-    if title.trim().is_empty() || title.chars().count() > 200 {
-        return Err("Memory title must be between 1 and 200 characters".into());
-    }
-    if body.trim().is_empty() || body.len() > 256 * 1024 {
-        return Err("Memory body must be between 1 byte and 256 KiB".into());
-    }
-    let sensitivity = match sensitivity.as_str() {
-        "public" => Sensitivity::Public,
-        "private" => Sensitivity::Private,
-        "sensitive" => Sensitivity::Sensitive,
-        _ => return Err("Unsupported sensitivity".into()),
-    };
     let memory = MemoryRecord {
         id: Uuid::new_v4(),
         title: title.trim().into(),
         body: body.trim().into(),
-        sensitivity,
+        sensitivity: parse_sensitivity(&sensitivity)?,
         allowed_hosts,
         created_at: Utc::now(),
     };
     let session = active_vault(&app)?;
     vault_ref(&session)?.add_memory(&memory).map_err(err)?;
     Ok(memory)
+}
+
+#[tauri::command]
+fn update_memory_record(
+    memory_id: String,
+    title: String,
+    body: String,
+    sensitivity: String,
+    allowed_hosts: Vec<String>,
+    app: State<AppRuntime>,
+) -> Result<MemoryRecord, String> {
+    let memory_id = Uuid::parse_str(&memory_id).map_err(err)?;
+    let session = active_vault(&app)?;
+    let vault = vault_ref(&session)?;
+    let existing = vault
+        .memory_record(memory_id)
+        .map_err(err)?
+        .ok_or("Memory record was not found")?;
+    let memory = MemoryRecord {
+        id: memory_id,
+        title: title.trim().into(),
+        body: body.trim().into(),
+        sensitivity: parse_sensitivity(&sensitivity)?,
+        allowed_hosts,
+        created_at: existing.created_at,
+    };
+    vault.update_memory(&memory).map_err(err)?;
+    Ok(memory)
+}
+
+#[tauri::command]
+fn delete_memory_record(memory_id: String, app: State<AppRuntime>) -> Result<(), String> {
+    let memory_id = Uuid::parse_str(&memory_id).map_err(err)?;
+    let session = active_vault(&app)?;
+    vault_ref(&session)?.delete_memory(memory_id).map_err(err)
+}
+
+#[tauri::command]
+fn delete_connection_definition(
+    connection_id: String,
+    app: State<AppRuntime>,
+) -> Result<(), String> {
+    let connection_id = Uuid::parse_str(&connection_id).map_err(err)?;
+    let session = active_vault(&app)?;
+    vault_ref(&session)?
+        .delete_connection(connection_id)
+        .map_err(err)
+}
+
+fn parse_sensitivity(value: &str) -> Result<Sensitivity, String> {
+    match value {
+        "public" => Ok(Sensitivity::Public),
+        "private" => Ok(Sensitivity::Private),
+        "sensitive" => Ok(Sensitivity::Sensitive),
+        _ => Err("Unsupported sensitivity".into()),
+    }
 }
 
 fn json_host(host: &str) -> Result<HostSnapshot, String> {
@@ -767,7 +918,7 @@ fn revoke_connection_deployment(
         Err(remove_error) => {
             vault.save_deployment(&blocked).map_err(err)?;
             Err(format!(
-                "New Cargo actions are locally blocked, but host removal could not be verified: {remove_error}. Retry after resolving the host error."
+                "Host removal is pending and could not be verified: {remove_error}. Cargo has not terminated existing client sessions or provider access. Retry after resolving the host error."
             ))
         }
     }
@@ -794,9 +945,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_state,
+            memory_records,
+            connection_records,
+            touch_vault,
+            purge_expired_previews,
             lock_vault,
             unlock_vault,
             create_local_profile,
+            rename_local_profile,
             export_safe_pack,
             export_encrypted_pack,
             import_host_configuration,
@@ -804,6 +960,9 @@ pub fn run() {
             prepare_encrypted_pack_import,
             apply_pack_import,
             add_memory_record,
+            update_memory_record,
+            delete_memory_record,
+            delete_connection_definition,
             plan_connection_install,
             apply_connection_install,
             revoke_connection_deployment

@@ -2,3 +2,46 @@
   outline: 3px solid #4b8058;
   outline-offset: 3px;
 }
+
+.modal:focus-visible {
+  outline-offset: -5px;
+}
+
+.connection-list span,
+.state,
+.memory-list span,
+.modal > span,
+.modal dt,
+.modal label,
+.hosts article code,
+.receipts time,
+.receipts span {
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .shell { grid-template-columns: 1fr; }
+  .shell > aside { position: static; height: auto; padding: 14px; }
+  .wordmark { padding-bottom: 12px; }
+  .shell nav { flex-direction: row; overflow-x: auto; }
+  .shell nav button { flex: 0 0 auto; }
+  .local { display: none; }
+  .workspace > header { height: auto; min-height: 68px; flex-wrap: wrap; gap: 10px; padding: 12px 18px; }
+  .workspace > header > div:last-child { flex-wrap: wrap; }
+  .content { padding: 36px 20px 70px; }
+  .heading h1 { font-size: 36px; }
+  .metrics { grid-template-columns: 1fr; }
+  .metrics article { min-height: 210px; border-right: 0; border-bottom: 1px solid #d9ddd5; }
+  .metrics article > strong { margin-top: 36px; }
+  .onboarding { grid-template-columns: 1fr; }
+  .intro { padding: 48px 28px; border-right: 0; border-bottom: 1px solid #d8dcd2; }
+  .intro .mark { margin-bottom: 32px; }
+  .intro h1 { font-size: 52px; }
+  .create-card { margin: 32px auto; width: min(430px, calc(100% - 40px)); padding: 28px; }
+  .import-preview, .export-selection, .choice-grid, .privacy-grid { grid-template-columns: 1fr; }
+  .modal-backdrop { padding: 12px; }
+  .modal { max-height: calc(100vh - 24px); padding: 22px; }
+  .receipts article { grid-template-columns: 1fr; gap: 7px; }
+  .hosts article { grid-template-columns: 40px 1fr; }
+  .hosts article > :last-child { grid-column: 2; justify-self: start; }
+}
