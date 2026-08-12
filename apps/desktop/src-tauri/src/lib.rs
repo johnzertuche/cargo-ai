@@ -57,6 +57,7 @@ struct PendingRemoval {
 
 struct PendingImport {
     pack: PortablePack,
+    expected_profile_id: Option<Uuid>,
     created_at: Instant,
 }
 
@@ -70,6 +71,7 @@ struct PendingProviderPreview {
 struct ImportPreview {
     import_id: Uuid,
     source_profile: String,
+    restores_profile: bool,
     exported_at: chrono::DateTime<Utc>,
     connections: Vec<ConnectionDefinition>,
     memory: Vec<MemoryRecord>,
@@ -755,18 +757,35 @@ fn import_host_configuration(host: String, app: State<AppRuntime>) -> Result<usi
     import_host(vault, &home_dir()?, &host).map_err(err)
 }
 
-fn stage_import(pack: PortablePack, app: &State<'_, AppRuntime>) -> Result<ImportPreview, String> {
+fn stage_import(pack: PortablePack, app: &AppRuntime) -> Result<ImportPreview, String> {
     let pack = validate_portable_pack(&pack).map_err(err)?;
+    let expected_profile_id = {
+        let session = active_vault(app)?;
+        vault_ref(&session)?
+            .profile()
+            .map_err(err)?
+            .map(|profile| profile.id)
+    };
+    let restores_profile = expected_profile_id.is_none();
     let import_id = Uuid::new_v4();
+    let profile_warning = if restores_profile {
+        format!(
+            "This empty vault will restore the exported local profile {:?}. Provider credentials, deployments, receipts, and the source vault key are not included.",
+            pack.profile.display_name
+        )
+    } else {
+        "Your current local profile is preserved; matching records are skipped during the transactional merge.".into()
+    };
     let preview = ImportPreview {
         import_id,
         source_profile: pack.profile.display_name.clone(),
+        restores_profile,
         exported_at: pack.exported_at,
         connections: pack.connections.clone(),
         memory: pack.memory.clone(),
         warnings: vec![
             "Imported executable definitions are untrusted until separately reviewed for installation.".into(),
-            "Your current local profile is preserved; matching records are skipped during the transactional merge.".into(),
+            profile_warning,
         ],
     };
     let mut imports = app.imports.lock().map_err(err)?;
@@ -778,10 +797,20 @@ fn stage_import(pack: PortablePack, app: &State<'_, AppRuntime>) -> Result<Impor
         import_id,
         PendingImport {
             pack,
+            expected_profile_id,
             created_at: Instant::now(),
         },
     );
     Ok(preview)
+}
+
+fn stage_encrypted_import_bytes(
+    bytes: &[u8],
+    passphrase: String,
+    app: &AppRuntime,
+) -> Result<ImportPreview, String> {
+    let pack = decrypt_pack(bytes, passphrase.into()).map_err(err)?;
+    stage_import(pack, app)
 }
 
 #[tauri::command]
@@ -806,16 +835,11 @@ async fn prepare_encrypted_pack_import(
     let Some(path) = pick_import(handle, "age").await? else {
         return Ok(None);
     };
-    let pack = decrypt_pack(&read_transfer_file(&path)?, passphrase.into()).map_err(err)?;
-    stage_import(pack, &app).map(Some)
+    let bytes = read_transfer_file(&path)?;
+    stage_encrypted_import_bytes(&bytes, passphrase, &app).map(Some)
 }
 
-#[tauri::command]
-fn apply_pack_import(
-    import_id: String,
-    app: State<'_, AppRuntime>,
-) -> Result<PackImportResult, String> {
-    let import_id = Uuid::parse_str(&import_id).map_err(err)?;
+fn apply_staged_import(import_id: Uuid, app: &AppRuntime) -> Result<PackImportResult, String> {
     let pending = app
         .imports
         .lock()
@@ -825,8 +849,19 @@ fn apply_pack_import(
     if pending.created_at.elapsed() >= Duration::from_secs(300) {
         return Err("Import preview expired; choose the file again".into());
     }
-    let session = active_vault(&app)?;
-    vault_ref(&session)?.import_pack(&pending.pack).map_err(err)
+    let session = active_vault(app)?;
+    let vault = vault_ref(&session)?;
+    vault
+        .import_pack_if_profile(&pending.pack, pending.expected_profile_id)
+        .map_err(err)
+}
+
+#[tauri::command]
+fn apply_pack_import(
+    import_id: String,
+    app: State<'_, AppRuntime>,
+) -> Result<PackImportResult, String> {
+    apply_staged_import(Uuid::parse_str(&import_id).map_err(err)?, &app)
 }
 
 #[tauri::command]
@@ -1055,4 +1090,123 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("run Cargo desktop")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_runtime(vault: Vault, vault_path: PathBuf) -> AppRuntime {
+        AppRuntime {
+            vault: Mutex::new(VaultSession {
+                vault: Some(vault),
+                last_access: Instant::now(),
+            }),
+            vault_path,
+            startup_error: Mutex::new(None),
+            plans: Mutex::new(HashMap::new()),
+            removals: Mutex::new(HashMap::new()),
+            imports: Mutex::new(HashMap::new()),
+            provider_previews: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn fresh_onboarding_uses_the_production_encrypted_import_path() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source =
+            Vault::open_with_key(source_dir.path().join("source.sqlite3"), [0x41; 32]).unwrap();
+        let profile = source.create_profile("Restored Desktop Profile").unwrap();
+        let memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "Desktop recovery".into(),
+            body: "The onboarding restore path is reachable before profile creation".into(),
+            sensitivity: Sensitivity::Private,
+            allowed_hosts: vec!["Cargo".into()],
+            created_at: Utc::now(),
+        };
+        source.add_memory(&memory).unwrap();
+        let encrypted = encrypt_pack(
+            &source.export_safe().unwrap(),
+            "desktop-clean-device-passphrase".into(),
+        )
+        .unwrap();
+        drop(source);
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.sqlite3");
+        let target_key = [0x42; 32];
+        let target = Vault::open_with_key(&target_path, target_key).unwrap();
+        let runtime = test_runtime(target, target_path.clone());
+        let preview = stage_encrypted_import_bytes(
+            &encrypted,
+            "desktop-clean-device-passphrase".into(),
+            &runtime,
+        )
+        .unwrap();
+        assert!(preview.restores_profile);
+        assert_eq!(preview.source_profile, profile.display_name);
+        let result = apply_staged_import(preview.import_id, &runtime).unwrap();
+        assert_eq!(result.memory_added, 1);
+        drop(runtime);
+
+        let reopened = Vault::open_with_key(&target_path, target_key).unwrap();
+        assert_eq!(reopened.profile().unwrap(), Some(profile));
+        assert_eq!(reopened.memory().unwrap(), vec![memory]);
+        assert!(reopened.verify_receipt_chain().unwrap());
+    }
+
+    #[test]
+    fn staged_restore_rejects_a_profile_created_after_preview() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source =
+            Vault::open_with_key(source_dir.path().join("source.sqlite3"), [0x51; 32]).unwrap();
+        source.create_profile("Exported Profile").unwrap();
+        source
+            .add_memory(&MemoryRecord {
+                id: Uuid::new_v4(),
+                title: "Must not import".into(),
+                body: "A stale preview cannot cross this boundary".into(),
+                sensitivity: Sensitivity::Private,
+                allowed_hosts: vec![],
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let encrypted = encrypt_pack(
+            &source.export_safe().unwrap(),
+            "desktop-stale-preview-passphrase".into(),
+        )
+        .unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.sqlite3");
+        let target = Vault::open_with_key(&target_path, [0x52; 32]).unwrap();
+        let runtime = test_runtime(target, target_path);
+        let preview = stage_encrypted_import_bytes(
+            &encrypted,
+            "desktop-stale-preview-passphrase".into(),
+            &runtime,
+        )
+        .unwrap();
+        assert!(preview.restores_profile);
+
+        {
+            let session = active_vault(&runtime).unwrap();
+            vault_ref(&session)
+                .unwrap()
+                .create_profile("New Local Profile")
+                .unwrap();
+        }
+
+        let error = apply_staged_import(preview.import_id, &runtime).unwrap_err();
+        assert!(error.contains("profile changed"));
+        let session = active_vault(&runtime).unwrap();
+        let vault = vault_ref(&session).unwrap();
+        assert_eq!(
+            vault.profile().unwrap().unwrap().display_name,
+            "New Local Profile"
+        );
+        assert!(vault.memory().unwrap().is_empty());
+        assert!(vault.connections().unwrap().is_empty());
+    }
 }

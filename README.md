@@ -12,6 +12,7 @@ The current release is a **private preview**. It is usable for a local profile, 
 - Typed local memory with sensitivity and allowed-host metadata
 - Credential-free JSON portable packs with explicit per-record export selection
 - Passphrase-encrypted `age` portable packs with previewed, transactional, idempotent merge
+- First-run encrypted-pack restore that adopts the exported profile and selected portable content on an empty vault
 - Two-phase install flow for Claude Desktop/Cursor JSON and the official Codex/Claude Code CLIs: exact executable preview, explicit approval, verification, receipt
 - Drift-safe removal of only the JSON fragment Cargo installed
 - Hash-chained local receipts with an explicit tail-truncation limitation
@@ -92,18 +93,19 @@ cargo run -p cargo-ai-cli -- provider disconnect GRANT_UUID
 
 ```bash
 cargo test --workspace
+cargo test -p cargo-ai-core --test clean_device_recovery
 cargo clippy --workspace --all-targets -- -D warnings
-cd apps/desktop && npm run build
+cd apps/desktop && npm test && npm run build
 cd ../.. && npm test
 ```
 
-The test suite includes encrypted-at-rest checks, wrong-key and wrong-passphrase rejection, malicious URL/symlink rejection, argument and URL secret redaction, bounded transactional import, stale-plan rejection, unrelated-field preservation, drift-safe removal, PKCE/resource binding, one-shot OAuth state, a loopback fake-provider conformance flow, refresh rotation/replay handling, cross-process grant ownership, offline revocation persistence, and proof that revocation acceptance is not mislabeled as verification.
+The test suite includes encrypted-at-rest checks, wrong-key and wrong-passphrase rejection, clean-device encrypted-pack recovery and restart, first-run Restore reachability, malicious URL/symlink rejection, argument and URL secret redaction, bounded transactional import, stale-plan rejection, unrelated-field preservation, drift-safe removal, PKCE/resource binding, one-shot OAuth state, a loopback fake-provider conformance flow, refresh rotation/replay handling, cross-process grant ownership, offline revocation persistence, and proof that revocation acceptance is not mislabeled as verification.
 
 The repository also contains a fail-closed production macOS workflow. It accepts only a GitHub-verified signed `vMAJOR.MINOR.PATCH` tag, requires Developer ID and App Store Connect credentials, notarizes and staples, runs Gatekeeper/signature/disk-image checks, emits CycloneDX SBOMs and SHA-256 checksums, creates GitHub provenance attestations, and publishes only after all gates pass. See [docs/PRODUCTION_RELEASE.md](docs/PRODUCTION_RELEASE.md).
 
 ## Release policy
 
-An unsigned local build is not a production release. A public credential-custody release additionally requires signed and notarized binaries, signed updates, SBOM/provenance, provider-specific connect/logout/revoke conformance tests, clean-device backup restore tests, and an independent security audit with remediation.
+An unsigned local build is not a production release. The clean-device portable-content restore gate is automated; it intentionally does not restore credentials or a copied vault key. A public credential-custody release additionally requires signed and notarized binaries, signed updates, SBOM/provenance, provider-specific connect/logout/revoke conformance tests, and an independent security audit with remediation.
 
 ## License
 

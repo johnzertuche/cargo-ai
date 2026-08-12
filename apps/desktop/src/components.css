@@ -68,6 +68,9 @@
 .choice-grid button:hover { border-color: #8da68f; background: #eef4eb; }
 .choice-grid small { color: #657067; font-size: 12px; font-weight: 500; }
 .modal-actions button.danger { border-color: #a94f36; background: #9b412b; color: #fff; }
+.create-card button.restore-action { border: 1px solid #c9d5c8; background: #f5f8f3; color: #24432e; }
+.onboarding-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0; color: #778179; font-size: 12px; }
+.onboarding-divider i { height: 1px; flex: 1; background: #dde2da; }
 .import-preview { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0; }
 .import-preview > section { min-width: 0; padding: 14px; border: 1px solid #dde2dc; border-radius: 10px; background: #fafbf9; }
 .import-preview > section > b { display: block; margin-bottom: 9px; font-size: 13px; }

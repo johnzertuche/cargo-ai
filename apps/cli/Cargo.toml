@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-cargo-ai-core = { path = "../../crates/core" }
+cargo-ai-core = { version = "0.1.0", path = "../../crates/core" }
 clap.workspace = true
 chrono.workspace = true
 serde_json.workspace = true

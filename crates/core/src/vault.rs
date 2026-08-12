@@ -1260,10 +1260,34 @@ impl Vault {
     }
 
     pub fn import_pack(&self, pack: &PortablePack) -> Result<PackImportResult> {
+        self.import_pack_transaction(pack, None)
+    }
+
+    /// Imports a previewed pack only if the profile visible inside the same
+    /// immediate SQLite transaction still matches the preview precondition.
+    pub fn import_pack_if_profile(
+        &self,
+        pack: &PortablePack,
+        expected_profile_id: Option<Uuid>,
+    ) -> Result<PackImportResult> {
+        self.import_pack_transaction(pack, Some(expected_profile_id))
+    }
+
+    fn import_pack_transaction(
+        &self,
+        pack: &PortablePack,
+        expected_profile_id: Option<Option<Uuid>>,
+    ) -> Result<PackImportResult> {
         let pack = validate_portable_pack(pack)?;
 
-        let transaction = self.db.unchecked_transaction()?;
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            if let Some(expected_profile_id) = expected_profile_id {
+                let current_profile_id = self.profile()?.map(|profile| profile.id);
+                if current_profile_id != expected_profile_id {
+                    bail!("the local profile changed after this preview; no records were imported");
+                }
+            }
             if self.profile()?.is_none() {
                 self.put("profile", pack.profile.id, &pack.profile)?;
             }
@@ -1315,10 +1339,13 @@ impl Vault {
         })();
         match result {
             Ok(result) => {
-                transaction.commit()?;
+                self.db.execute_batch("COMMIT")?;
                 Ok(result)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
     }
 
@@ -1655,6 +1682,43 @@ mod tests {
         assert_eq!(second.memory_skipped, 1);
         assert_eq!(target.profile().unwrap().unwrap().display_name, "Target");
         assert_eq!(target.memory().unwrap(), vec![memory]);
+    }
+
+    #[test]
+    fn conditional_pack_import_rejects_a_cross_process_profile_change() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Vault::open_with_key(source_dir.path().join("source.db"), [14; 32]).unwrap();
+        source.create_profile("Source").unwrap();
+        source
+            .add_memory(&MemoryRecord {
+                id: Uuid::new_v4(),
+                title: "Conditional import".into(),
+                body: "This record must not cross a stale preview".into(),
+                sensitivity: crate::Sensitivity::Private,
+                allowed_hosts: vec![],
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let pack = source.export_safe().unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.db");
+        let preview_handle = Vault::open_with_key(&target_path, [15; 32]).unwrap();
+        let competing_handle = Vault::open_with_key(&target_path, [15; 32]).unwrap();
+        competing_handle
+            .create_profile("Competing Profile")
+            .unwrap();
+
+        let error = preview_handle
+            .import_pack_if_profile(&pack, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("profile changed"));
+        assert!(preview_handle.memory().unwrap().is_empty());
+        assert!(preview_handle.connections().unwrap().is_empty());
+        assert_eq!(
+            preview_handle.profile().unwrap().unwrap().display_name,
+            "Competing Profile"
+        );
     }
 
     #[test]

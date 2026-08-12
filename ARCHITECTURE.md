@@ -31,7 +31,7 @@ Canonical JSON carrying a profile, connection definitions, and memory. It contai
 
 ### Encrypted portable pack
 
-The same validated portable manifest inside the published `age` passphrase format. Input and plaintext are capped at 32 MiB. Unknown format/version values and wrong passphrases fail closed. Imports show an exact local preview, preserve the destination profile, and transactionally skip duplicate records. This is not full-vault recovery: credentials, deployments, receipts, and the OS-wrapped vault key are excluded.
+The same validated portable manifest inside the published `age` passphrase format. Input and plaintext are capped at 32 MiB. Unknown format/version values and wrong passphrases fail closed. Imports show an exact local preview and transactionally skip duplicate records. An empty destination adopts the exported profile; an existing destination preserves its local profile. This is portable-content recovery, not full-vault recovery: credentials, deployments, receipts, provider lifecycle state, and the OS-wrapped vault key are excluded and must be recreated or reauthorized.
 
 ## Adapter contract
 

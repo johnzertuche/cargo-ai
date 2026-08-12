@@ -13,10 +13,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 concurrency:
   group: cargo-production-release
@@ -27,18 +24,39 @@ env:
 
 jobs:
   macos:
-    name: Sign, notarize, verify, and publish macOS
+    name: Verify, sign, and notarize macOS
     runs-on: macos-15
     environment: production-release
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22.22.0
           cache: npm
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.0
+          cache: false
+
+      - name: Scan the complete signed-tag history for secrets
+        run: |
+          export GOBIN="$RUNNER_TEMP/cargo-security-bin"
+          mkdir -p "$GOBIN"
+          go install github.com/zricethezav/gitleaks/v8@v8.28.0
+          "$GOBIN/gitleaks" git --redact --exit-code 1 --no-banner
+          fixture="$(mktemp -d)"
+          printf '%s%s\n%s\n' '-----BEGIN ' 'PRIVATE KEY-----' 'synthetic-cargo-policy-fixture' > "$fixture/leak.pem"
+          set +e
+          "$GOBIN/gitleaks" dir "$fixture" --redact --exit-code 1 --no-banner >/dev/null 2>&1
+          fixture_result="$?"
+          set -e
+          test "$fixture_result" = 1 || { echo "gitleaks failed its synthetic detection control" >&2; exit 1; }
 
       - name: Fail closed when production credentials are unavailable
         env:
@@ -95,8 +113,15 @@ jobs:
           npm ci
           npm ci --prefix apps/desktop
           cargo test --workspace --locked
+          cargo test -p cargo-ai-core --test clean_device_recovery --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo fmt --all -- --check
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny check licenses bans sources
+          npm test
+          npm test --prefix apps/desktop
+          npm run build --prefix apps/desktop
+          npm run security:supply-chain
           npm audit --omit=dev
           npm audit --omit=dev --prefix apps/desktop
 
@@ -179,6 +204,55 @@ jobs:
           cp release-commit.txt release-assets/BUILD_COMMIT
           shasum -a 256 release-assets/* > release-assets/SHA256SUMS
 
+      - name: Hand verified artifacts to the isolated publisher
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cargo-production-release-assets
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/cargo-release.keychain-db" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/cargo-release-gnupg"
+          rm -f "$RUNNER_TEMP/cargo-developer-id.p12" "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/cargo-release-signers.asc" "$RUNNER_TEMP/cargo-tag-verification.log"
+
+  publish:
+    name: Attest and publish verified artifacts
+    needs: macos
+    runs-on: ubuntu-latest
+    environment: production-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download the fixed build output
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cargo-production-release-assets
+          path: release-assets
+
+      - name: Revalidate checksums and signed-tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -s release-assets/BUILD_COMMIT
+          test -s release-assets/SHA256SUMS
+          shasum -a 256 -c release-assets/SHA256SUMS
+          build_commit="$(cat release-assets/BUILD_COMMIT)"
+          grep -Eq '^[0-9a-f]{40}$' release-assets/BUILD_COMMIT || { echo "BUILD_COMMIT is not a full lowercase commit SHA" >&2; exit 1; }
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          test "$(jq -r '.object.type' <<<"$ref_json")" = tag || { echo "production tag is no longer annotated" >&2; exit 1; }
+          tag_sha="$(jq -r '.object.sha' <<<"$ref_json")"
+          tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")"
+          test "$(jq -r '.verification.verified' <<<"$tag_json")" = true || { echo "production tag is no longer verified" >&2; exit 1; }
+          test "$(jq -r '.object.type' <<<"$tag_json")" = commit || { echo "signed tag does not directly target a commit" >&2; exit 1; }
+          test "$(jq -r '.object.sha' <<<"$tag_json")" = "$build_commit" || { echo "artifact commit does not match the signed tag" >&2; exit 1; }
+
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8 # v3.1.0
         with:
@@ -188,16 +262,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          build_commit="$(cat release-assets/BUILD_COMMIT)"
           if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish >/tmp/cargo-existing-release.json 2>/dev/null; then
             test "$(jq -r '.isDraft' /tmp/cargo-existing-release.json)" = true || { echo "refusing to mutate an already-published release" >&2; exit 1; }
             commitish="$(jq -r '.targetCommitish' /tmp/cargo-existing-release.json)"
             case "$commitish" in
-              "$RELEASE_TAG"|"$(cat release-commit.txt)") ;;
+              "$RELEASE_TAG"|"$build_commit") ;;
               *) echo "existing draft targets a different commit" >&2; exit 1 ;;
             esac
             gh release upload "$RELEASE_TAG" release-assets/* --clobber
           else
-            gh release create "$RELEASE_TAG" release-assets/* --draft --verify-tag --generate-notes --title "Cargo ${RELEASE_TAG}" --target "$(cat release-commit.txt)"
+            gh release create "$RELEASE_TAG" release-assets/* --draft --verify-tag --generate-notes --title "Cargo ${RELEASE_TAG}" --target "$build_commit"
           fi
 
       - name: Verify inventory and publish draft atomically
@@ -208,10 +283,3 @@ jobs:
           actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
           test "$actual" = "$expected" || { echo "draft release asset inventory mismatch" >&2; exit 1; }
           gh release edit "$RELEASE_TAG" --draft=false
-
-      - name: Remove temporary signing material
-        if: always()
-        run: |
-          security delete-keychain "$RUNNER_TEMP/cargo-release.keychain-db" 2>/dev/null || true
-          rm -rf "$RUNNER_TEMP/cargo-release-gnupg"
-          rm -f "$RUNNER_TEMP/cargo-developer-id.p12" "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/cargo-release-signers.asc" "$RUNNER_TEMP/cargo-tag-verification.log"

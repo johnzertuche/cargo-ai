@@ -2,7 +2,7 @@
 
 Cargo is a public native OAuth client. It never embeds or claims a confidential client secret. A remote MCP server is connectable only when it supports a preconfigured public client, Client ID Metadata Document, Dynamic Client Registration, or an explicitly supplied public client registration.
 
-The current implementation includes the security core, a bounded Rust HTTP transport, an exact one-shot native loopback callback receiver, and an in-process OAuth/MCP conformance provider used only by tests. It validates and tests metadata, PKCE, state, resource binding, encrypted grant persistence, refresh rotation/replay, and revocation transitions. The desktop and CLI do not yet launch the user’s browser, expose provider connection controls, persist live tokens, or advertise compatibility with a named provider.
+The current private preview includes the security core, a bounded Rust HTTP transport, an exact one-shot native loopback callback receiver, desktop and CLI provider controls, and an in-process OAuth/MCP provider used only by tests. After an exact preview and confirmation, the native app launches the system browser; the macOS CLI uses the absolute system opener with a cleared environment. Cargo validates metadata, PKCE, state, resource binding, encrypted grant state, crash recovery, refresh rotation/replay, and honest revocation transitions. It does not advertise compatibility with a named provider or full official MCP conformance yet.
 
 ## Discovery and authorization invariants
 
@@ -15,13 +15,15 @@ The current implementation includes the security core, a bounded Rust HTTP trans
 - State and PKCE verifier values use 256 bits of operating-system randomness. State is one-shot and compared through a fixed-size digest without an early exit.
 - Authorization transactions are non-serializable, redact secrets from `Debug`, and zeroize state/verifier buffers on drop.
 
-Network discovery uses response/time caps, zero redirects, recursive duplicate-key rejection, proxy bypass, conservative public-address validation, and per-request pinned DNS resolution. Additional discovery fallback variants and real-provider conformance remain release gates before the desktop or CLI enables live authorization.
+Network discovery uses response/time caps, zero redirects, recursive duplicate-key rejection, proxy bypass, conservative public-address validation, and per-request pinned DNS resolution. The browser callback binds before the authorization URL is created, accepts one exact state-bearing request, and closes on success, error, or expiry. Additional official-harness scenarios and real-provider conformance remain release gates before named-provider support is claimed.
 
 ## Token boundary
 
-Future token values are stored only under opaque, grant-scoped operating-system credential references. Provider-grant records may contain issuer, resource, public client ID, scopes, expiry, lifecycle state, and opaque references; they may never contain access/refresh token values. Tokens may be leased only inside the Rust HTTP transport, bound to one resource and required scopes, and sent only in the `Authorization` header. Renderer, CLI, logs, receipts, crash diagnostics, connection definitions, and portable packs never receive them.
+Live token values are stored only under opaque, grant-scoped operating-system Keychain references. Provider-grant records may contain issuer, resource, public client ID, scopes, expiry, lifecycle state, and opaque references; they may never contain access/refresh token values. Tokens may be leased only inside the Rust HTTP transport, bound to one resource and required scopes, and sent only in the `Authorization` header. Renderer, CLI output, logs, receipts, crash diagnostics, connection definitions, and portable packs never receive them.
 
-Refresh requires single-flight synchronization and atomic rotation. Cargo does not activate or use a refresh token until provider rotation or sender constraint is proven. If an authorization response nevertheless issues one, Cargo retains it in the operating-system credential store only inside a locally blocked, durable provider-cleanup lifecycle; it is never silently discarded or converted into an access-only grant. Active refresh persistence remains disabled and access expiry requires reauthorization.
+Before the authorization-code exchange can leave the process, Cargo durably records an `AuthorizationPending` reservation and issuance intent. Ambiguous timeouts, malformed success responses, process restarts, and partial Keychain/SQLite failures remain blocked cleanup operations instead of being mislabeled credential-free cancellations. Startup reconciliation retains any available credential custody and never activates an unresolved grant.
+
+Refresh requires single-flight synchronization and atomic rotation. Cargo does not activate or use a refresh token until provider rotation or sender constraint is proven. If an authorization response nevertheless issues one, Cargo retains it in Keychain only inside a locally blocked, durable, refresh-first provider-cleanup lifecycle; it is never silently discarded or converted into an access-only grant. Active refresh persistence remains disabled and access expiry requires reauthorization.
 
 ## Revocation evidence
 
@@ -34,5 +36,7 @@ An RFC 7009 success is intentionally recorded as `accepted_unverified`: the RFC 
 - a future provider-specific verifier proves the full grant inactive.
 
 If a refresh token exists, access-token rejection alone leaves `provider_revoked_unverified`. Network and service failures remain locally blocked with a persisted retry time. Error persistence accepts only bounded lowercase safe codes—not provider bodies or token-bearing diagnostics.
+
+The deterministic in-process provider exercises discovery, callback, exchange, resource access, refresh rotation/replay-family invalidation, revocation acceptance, and explicit invalid-token rejection. It is not the official MCP conformance harness and is not evidence for a named SaaS provider. Official harness integration, disposable named-provider accounts, and an independent security review remain production gates.
 
 Primary specifications: [MCP Authorization 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700), [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707), [RFC 8252](https://www.rfc-editor.org/rfc/rfc8252), and [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009).

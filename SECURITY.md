@@ -50,12 +50,14 @@ Disconnect must report these outcomes separately:
 3. Host-local OAuth credentials logged out and verified
 4. Provider revocation requested
 5. Provider rejection verified where the provider supports evidence
-6. Local encrypted material cryptographically erased
+6. Local credential references deleted and cleanup verified
 
 Offline/provider failures remain locally blocked and pending. The UI must not say fully revoked without mandatory evidence.
 
+Deletion is currently logical, not a claim of physical or cryptographic erasure. SQLite/WAL pages, filesystem snapshots, and platform credential-store internals may retain encrypted historical bytes. Cargo must not claim cryptographic erasure unless a future per-record key design deletes the only wrapped data-encryption key and verifies the crash-consistent transition.
+
 ## Release security
 
-Production release requires signed/notarized binaries, signed updates, pinned lockfiles, dependency/secret/license scanning, SBOM and provenance, malicious-import and crash-consistency testing, clean-device restore testing, real adapter conformance tests, and an independent audit with remediation.
+Production release requires signed/notarized binaries, signed updates, pinned lockfiles, dependency/secret/license scanning, SBOM and provenance, malicious-import and crash-consistency testing, clean-device portable-content restore testing, real adapter conformance tests, and an independent audit with remediation.
 
 The production macOS workflow is deliberately fail-closed: missing Apple credentials, an unsigned/lightweight/mismatched tag, ad-hoc signing, failed notarization/stapling, Gatekeeper rejection, or a failed test/audit prevents publication. The existing preview artifacts remain explicitly ad-hoc signed and are not promoted by that workflow.

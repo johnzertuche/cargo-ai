@@ -7,7 +7,7 @@ type Connection = { id: string; name: string; transport: string; command: string
 type Deployment = { id: string; connection_id: string; host: string; server_name: string; config_path: string; state: "active" | "local_blocked" | "host_removed" | "conflict" | "failed"; installed_at: string };
 type MemoryRecord = { id: string; title: string; body: string; sensitivity: "public" | "private" | "sensitive"; allowed_hosts: string[]; created_at: string };
 type ImportResult = { connections_added: number; connections_skipped: number; memory_added: number; memory_skipped: number };
-type ImportPreview = { import_id: string; source_profile: string; exported_at: string; connections: Connection[]; memory: MemoryRecord[]; warnings: string[] };
+type ImportPreview = { import_id: string; source_profile: string; restores_profile: boolean; exported_at: string; connections: Connection[]; memory: MemoryRecord[]; warnings: string[] };
 type Receipt = { id: string; action: string; target: string; outcome: string; record_hash: string; created_at: string };
 type ProviderGrant = { id: string; connection_id: string; resource: string; issuer: string; scopes: string[]; access_expires_at: string | null; status: string; created_at: string; last_verified_at: string | null };
 type ProviderPreview = { preview_id: string; resource: string; issuer: string; scopes_supported: string[]; refresh_persistence: string };
@@ -24,6 +24,7 @@ export default function App() {
   const vaultGeneration = useRef(0);
   const memoryRequest = useRef(0);
   const connectionRequest = useRef(0);
+  const onboardingRestoreButton = useRef<HTMLButtonElement>(null);
   const [locked, setLocked] = useState(false);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(true);
@@ -281,10 +282,13 @@ export default function App() {
         setImportPreview(preview);
         setBusy(false);
       } else {
+        setEncryptedImportOpen(false);
+        setImportPassphrase("");
         setBusy(false);
       }
     } catch (caught) {
       setError(String(caught));
+      setImportPassphrase("");
       setBusy(false);
     }
   };
@@ -472,13 +476,23 @@ export default function App() {
     }
   };
 
+  const closeEncryptedImport = () => {
+    setEncryptedImportOpen(false);
+    setImportPassphrase("");
+    window.setTimeout(() => onboardingRestoreButton.current?.focus(), 0);
+  };
+
   if (locked) return <main className="lock-screen"><section><Mark /><span>LOCAL VAULT LOCKED</span><h1>The vault key is unloaded.</h1><p>Cargo cleared active UI state on a best-effort basis. JavaScript strings cannot be cryptographically erased from managed memory. Unlock reads the existing vault key from this Mac's Keychain; this soft lock does not require biometric presence.</p><button onClick={() => void unlock()} disabled={busy}>{busy ? "Unlocking…" : "Unlock local vault"}</button>{error && <div className="error">{error}</div>}</section></main>;
   if (busy && state.profile === null) return <main className="loading">Opening your local vault…</main>;
   if (openError && state.profile === null) return <main className="lock-screen"><section><Mark /><span>VAULT RECOVERY REQUIRED</span><h1>Cargo refused to replace your encryption key.</h1><p>The existing vault could not be opened. No new key or database was created. Restore the missing Keychain entry or a supported recovery artifact before continuing.</p><div className="error">{openError}</div></section></main>;
-  if (!state.profile) return <main className="onboarding">
-    <section className="intro"><Mark /><p className="eyebrow">LOCAL-FIRST AI PORTABILITY</p><h1>Your AI life.<br /><em>Owned by you.</em></h1><p className="lead">Create a private profile and encrypted vault on this Mac. No email, cloud account, or hosted credential database.</p></section>
-    <section className="create-card"><span>01 / CREATE LOCAL PROFILE</span><h2>What should we call you?</h2><label>Display name<input autoFocus value={name} onChange={event => setName(event.target.value)} onKeyDown={event => event.key === "Enter" && void create()} placeholder="Your name" /></label><button onClick={() => void create()} disabled={!name.trim() || busy}>Create encrypted vault <b>→</b></button><p>Protected by macOS Keychain. Your local profile never leaves this device.</p>{error && <div className="error">{error}</div>}</section>
-  </main>;
+  if (!state.profile) return <>
+    <main className="onboarding" inert={encryptedImportOpen || Boolean(importPreview) || busy}>
+      <section className="intro"><Mark /><p className="eyebrow">LOCAL-FIRST AI PORTABILITY</p><h1>Your AI life.<br /><em>Owned by you.</em></h1><p className="lead">Create a new private profile or restore profile and portable content from an encrypted pack. No email, cloud account, or hosted credential database.</p></section>
+      <section className="create-card"><span>01 / START LOCAL VAULT</span><h2>New here—or carrying your setup?</h2><label>Display name<input autoFocus value={name} onChange={event => setName(event.target.value)} onKeyDown={event => event.key === "Enter" && void create()} placeholder="Your name" /></label><button onClick={() => void create()} disabled={!name.trim() || busy}>Create new local profile <b>→</b></button><div className="onboarding-divider"><i />or<i /></div><button ref={onboardingRestoreButton} className="restore-action" onClick={() => setEncryptedImportOpen(true)} disabled={busy}>Restore encrypted pack <b>↗</b></button><p>Restore adopts the exported profile only while this vault is empty. It restores selected definitions and memory—not credentials, deployment history, receipts, or the source vault key.</p>{error && <div className="error" role="alert">{error}</div>}</section>
+    </main>
+    {encryptedImportOpen && <ImportModal passphrase={importPassphrase} busy={busy} onPassphrase={setImportPassphrase} onClose={closeEncryptedImport} onImport={importEncrypted} />}
+    {importPreview && <ImportPreviewModal preview={importPreview} busy={busy} onClose={() => setImportPreview(null)} onImport={applyImport} />}
+  </>;
 
   const connected = state.hosts.filter(host => host.exists).length;
   const activeDeployments = state.deployments.filter(item => item.state === "active");
@@ -628,7 +642,7 @@ function ExportSelectionModal({ mode, connections, memory, selectedConnections, 
 function ImportPreviewModal({ preview, busy, onClose, onImport }: { preview: ImportPreview; busy: boolean; onClose: () => void; onImport: () => Promise<void> }) {
   const [confirmed, setConfirmed] = useState(false);
   const dialogRef = useDialog(onClose, busy);
-  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal wide" role="dialog" aria-modal="true" aria-labelledby="import-preview-title"><span>EXACT LOCAL PREVIEW</span><h2 id="import-preview-title">Review before merging anything.</h2><p>Exported by {preview.source_profile} on {new Date(preview.exported_at).toLocaleString()}. Your current profile remains unchanged.</p>{preview.warnings.length > 0 && <ul>{preview.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul>}<div className="import-preview"><section><b>{preview.connections.length} connection definitions</b>{preview.connections.length === 0 ? <p>None</p> : preview.connections.map(connection => <details key={connection.id}><summary>{connection.name} · {connection.transport.replace("_", " ")}</summary><div className="execution-preview">{connection.command && <><b>Command</b><code>{connection.command}</code></>}{connection.url && <><b>Endpoint</b><code>{connection.url}</code></>}{connection.args.length > 0 && <><b>Arguments</b><ol>{connection.args.map((argument, index) => <li key={`${index}-${argument}`}><code>{argument}</code></li>)}</ol></>}{connection.environment_keys.length > 0 && <p>Requires fresh authorization for: {connection.environment_keys.join(", ")}</p>}</div></details>)}</section><section><b>{preview.memory.length} memory records</b>{preview.memory.length === 0 ? <p>None</p> : preview.memory.map(memory => <details key={memory.id}><summary>{memory.title} · {memory.sensitivity}</summary><p className="memory-preview">{memory.body}</p><small>{memory.allowed_hosts.length ? `Allowed hosts: ${memory.allowed_hosts.join(", ")}` : "No allowed hosts assigned"}</small></details>)}</section></div><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />Merge these reviewed records transactionally. Matching records will be skipped.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button onClick={() => void onImport()} disabled={!confirmed || busy}>{busy ? "Merging…" : "Approve and merge"}</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal wide" role="dialog" aria-modal="true" aria-labelledby="import-preview-title"><span>EXACT LOCAL PREVIEW</span><h2 id="import-preview-title">Review before {preview.restores_profile ? "restoring" : "merging"} anything.</h2><p>Exported by {preview.source_profile} on {new Date(preview.exported_at).toLocaleString()}. {preview.restores_profile ? `This empty vault will adopt the exported profile ${preview.source_profile}.` : "Your current profile remains unchanged."}</p>{preview.warnings.length > 0 && <ul>{preview.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul>}<div className="import-preview"><section><b>{preview.connections.length} connection definitions</b>{preview.connections.length === 0 ? <p>None</p> : preview.connections.map(connection => <details key={connection.id}><summary>{connection.name} · {connection.transport.replace("_", " ")}</summary><div className="execution-preview">{connection.command && <><b>Command</b><code>{connection.command}</code></>}{connection.url && <><b>Endpoint</b><code>{connection.url}</code></>}{connection.args.length > 0 && <><b>Arguments</b><ol>{connection.args.map((argument, index) => <li key={`${index}-${argument}`}><code>{argument}</code></li>)}</ol></>}{connection.environment_keys.length > 0 && <p>Requires fresh authorization for: {connection.environment_keys.join(", ")}</p>}</div></details>)}</section><section><b>{preview.memory.length} memory records</b>{preview.memory.length === 0 ? <p>None</p> : preview.memory.map(memory => <details key={memory.id}><summary>{memory.title} · {memory.sensitivity}</summary><p className="memory-preview">{memory.body}</p><small>{memory.allowed_hosts.length ? `Allowed hosts: ${memory.allowed_hosts.join(", ")}` : "No allowed hosts assigned"}</small></details>)}</section></div><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />{preview.restores_profile ? "Restore this reviewed profile and portable content transactionally." : "Merge these reviewed records transactionally. Matching records will be skipped."}</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button onClick={() => void onImport()} disabled={!confirmed || busy}>{busy ? (preview.restores_profile ? "Restoring…" : "Merging…") : (preview.restores_profile ? "Approve and restore" : "Approve and merge")}</button></div></section></div>;
 }
 
 function ImportModal({ passphrase, busy, onPassphrase, onClose, onImport }: { passphrase: string; busy: boolean; onPassphrase: (value: string) => void; onClose: () => void; onImport: () => Promise<void> }) {

@@ -14,6 +14,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  security-policy:
+    name: Secret, license, and source policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.0
+          cache: false
+      - name: Scan complete history and prove synthetic-secret detection
+        run: |
+          export GOBIN="$RUNNER_TEMP/cargo-security-bin"
+          mkdir -p "$GOBIN"
+          go install github.com/zricethezav/gitleaks/v8@v8.28.0
+          "$GOBIN/gitleaks" git --redact --exit-code 1 --no-banner
+          fixture="$(mktemp -d)"
+          printf '%s%s\n%s\n' '-----BEGIN ' 'PRIVATE KEY-----' 'synthetic-cargo-policy-fixture' > "$fixture/leak.pem"
+          set +e
+          "$GOBIN/gitleaks" dir "$fixture" --redact --exit-code 1 --no-banner >/dev/null 2>&1
+          fixture_result="$?"
+          set -e
+          test "$fixture_result" = 1 || { echo "gitleaks failed its synthetic detection control" >&2; exit 1; }
+      - name: Enforce Rust license, wildcard, and registry policy
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny check licenses bans sources
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22.22.0
+          cache: npm
+      - name: Verify npm licenses, registries, and integrity pins
+        run: npm run security:supply-chain
+
   rust:
     name: Rust core and desktop boundary
     runs-on: macos-15
@@ -21,6 +56,8 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Test workspace
         run: cargo test --workspace --locked
+      - name: Prove clean-device encrypted-pack recovery
+        run: cargo test -p cargo-ai-core --test clean_device_recovery --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Formatting
@@ -44,6 +81,9 @@ jobs:
       - name: Install desktop renderer dependencies
         working-directory: apps/desktop
         run: npm ci
+      - name: Test fresh-device desktop onboarding
+        working-directory: apps/desktop
+        run: npm test
       - name: Build desktop renderer
         working-directory: apps/desktop
         run: npm run build
