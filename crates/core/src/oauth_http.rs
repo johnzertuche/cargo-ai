@@ -9,7 +9,7 @@ use crate::{RevocationVerification, TokenRevocationResult};
 use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::blocking::{Body, Client, Response};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{
     Deserialize,
@@ -196,12 +196,31 @@ impl OAuthProviderTransport for HttpOAuthTransport {
         bearer.zeroize();
         if response.status().is_success() {
             Ok(RevocationVerification::StillActive)
-        } else if matches!(response.status().as_u16(), 401 | 403) {
+        } else if response.status().as_u16() == 401 && explicit_invalid_token(&response) {
             Ok(RevocationVerification::ResourceRejected)
+        } else if matches!(response.status().as_u16(), 401 | 403) {
+            Ok(RevocationVerification::Unsupported)
         } else {
             bail!("protected-resource probe returned an inconclusive status")
         }
     }
+}
+
+fn explicit_invalid_token(response: &Response) -> bool {
+    response
+        .headers()
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.strip_prefix("bearer ").is_some_and(|parameters| {
+                parameters
+                    .split(',')
+                    .map(str::trim)
+                    .any(|part| part == "error=\"invalid_token\"" || part == "error=invalid_token")
+            })
+        })
 }
 
 struct SecretText(Zeroizing<String>);
@@ -968,7 +987,7 @@ mod tests {
                 401,
                 "application/json",
                 "{\"error\":\"invalid_token\"}",
-                &[],
+                &[("WWW-Authenticate", "Bearer error=\"invalid_token\"")],
             )
         }
     }
@@ -1066,6 +1085,18 @@ mod tests {
 
         let expanded = br#"{"access_token":"access-secret","token_type":"Bearer","expires_in":300,"scope":"read admin"}"#;
         assert!(parse_token_payload(expanded, &["read".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn explicit_invalid_token_parser_rejects_ambiguous_challenges() {
+        let provider = FakeProvider::start();
+        let endpoint = provider.base.join("missing").unwrap();
+        let response = client_for(&endpoint, EndpointPolicy::TestLoopbackHttp)
+            .unwrap()
+            .get(endpoint)
+            .send()
+            .unwrap();
+        assert!(!explicit_invalid_token(&response));
     }
 
     #[test]

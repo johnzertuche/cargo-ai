@@ -134,6 +134,7 @@ pub enum ClientRegistrationKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantStatus {
+    AuthorizationPending,
     Active,
     ReauthRequired,
     LocallyBlocked,

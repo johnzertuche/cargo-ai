@@ -560,7 +560,11 @@ pub fn validate_provider_grant(grant: &ProviderGrant) -> Result<()> {
     if let Some(reference) = &grant.refresh_secret_ref {
         validate_secret_reference(grant.id, reference, "refresh")?;
     }
-    if grant.status == GrantStatus::Active && grant.current_revocation_id.is_some() {
+    if matches!(
+        grant.status,
+        GrantStatus::Active | GrantStatus::AuthorizationPending
+    ) && grant.current_revocation_id.is_some()
+    {
         bail!("an active grant cannot reference a revocation operation");
     }
     Ok(())

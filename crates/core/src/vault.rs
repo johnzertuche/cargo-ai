@@ -72,6 +72,7 @@ impl Vault {
         vault.encrypt_legacy_rows()?;
         vault.harden_database_files()?;
         vault.reconcile_grant_activations()?;
+        vault.reconcile_pending_provider_authorizations()?;
         Ok(vault)
     }
 
@@ -426,6 +427,67 @@ impl Vault {
         self.by_id("provider_grants", id)
     }
 
+    /// Loads credential material only for a Rust transport operation. Callers
+    /// must never serialize, log, or return these values across an IPC boundary.
+    pub fn provider_credentials_for_transport(
+        &self,
+        grant_id: Uuid,
+    ) -> Result<(SecretString, Option<SecretString>)> {
+        let grant = self
+            .provider_grant(grant_id)?
+            .context("provider grant was not found")?;
+        if grant.status != crate::GrantStatus::Active {
+            bail!("provider grant is not active");
+        }
+        let mut access_value = self.read_secret_value(&grant.access_secret_ref)?;
+        let access = SecretString::from(std::mem::take(&mut *access_value));
+        let refresh = grant
+            .refresh_secret_ref
+            .as_deref()
+            .map(|reference| {
+                self.read_secret_value(reference)
+                    .map(|mut value| SecretString::from(std::mem::take(&mut *value)))
+            })
+            .transpose()?;
+        Ok((access, refresh))
+    }
+
+    /// Loads credentials for the one matching durable revocation operation.
+    /// The grant remains locally blocked; this cannot mint a normal token lease.
+    pub fn provider_credentials_for_revocation(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<(ProviderGrant, SecretString, Option<SecretString>)> {
+        let operation = self
+            .revocation_operation(operation_id)?
+            .context("revocation operation was not found")?;
+        let grant = self
+            .provider_grant(operation.grant_id)?
+            .context("provider grant was not found")?;
+        if grant.current_revocation_id != Some(operation_id)
+            || !matches!(
+                grant.status,
+                crate::GrantStatus::RevocationPending
+                    | crate::GrantStatus::ProviderRevokedUnverified
+                    | crate::GrantStatus::Partial
+                    | crate::GrantStatus::LocallyBlocked
+            )
+        {
+            bail!("provider revocation operation does not own this blocked grant");
+        }
+        let mut access_value = self.read_secret_value(&grant.access_secret_ref)?;
+        let access = SecretString::from(std::mem::take(&mut *access_value));
+        let refresh = grant
+            .refresh_secret_ref
+            .as_deref()
+            .map(|reference| {
+                self.read_secret_value(reference)
+                    .map(|mut value| SecretString::from(std::mem::take(&mut *value)))
+            })
+            .transpose()?;
+        Ok((grant, access, refresh))
+    }
+
     pub fn revocation_operations(&self) -> Result<Vec<RevocationOperation>> {
         self.all("revocations", true)
     }
@@ -461,6 +523,273 @@ impl Vault {
         Ok(())
     }
 
+    /// Reserves one authorization lifecycle for a connection before the
+    /// browser opens. The reservation contains no credential material, but it
+    /// prevents two concurrent callbacks from creating competing grants.
+    pub fn reserve_provider_authorization(&self, grant: &ProviderGrant) -> Result<()> {
+        if grant.status != crate::GrantStatus::AuthorizationPending {
+            bail!("provider authorization reservation must be pending");
+        }
+        if grant.refresh_secret_ref.is_some() || grant.current_revocation_id.is_some() {
+            bail!("provider authorization reservation cannot contain refresh or revocation state");
+        }
+        crate::oauth::validate_provider_grant(grant)?;
+        if self.connection(grant.connection_id)?.is_none() {
+            bail!("provider grant references an unknown connection");
+        }
+        if self.provider_grant(grant.id)?.is_some()
+            || self.provider_grants()?.iter().any(|existing| {
+                existing.connection_id == grant.connection_id && !existing.status.is_terminal()
+            })
+        {
+            bail!("connection already has an unresolved provider authorization");
+        }
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("provider_grants", grant.id, grant)?;
+        self.receipt(
+            "provider_authorization.reserved",
+            &grant.id.to_string(),
+            "success",
+            "no-credentials-issued",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Removes a browser-flow reservation only while it is still known to
+    /// contain no issued credentials.
+    pub fn cancel_provider_authorization(&self, grant_id: Uuid) -> Result<()> {
+        let grant = self
+            .provider_grant(grant_id)?
+            .context("provider authorization reservation was not found")?;
+        if grant.status != crate::GrantStatus::AuthorizationPending
+            || grant.current_revocation_id.is_some()
+        {
+            bail!("provider authorization can no longer be cancelled without revocation");
+        }
+        if self.grant_activation_operations()?.iter().any(|operation| {
+            operation.grant_id == grant_id && operation.state != GrantActivationState::Completed
+        }) {
+            bail!("provider authorization has entered credential custody and must be revoked");
+        }
+        let transaction = self.db.unchecked_transaction()?;
+        self.delete_row("provider_grants", grant.id)?;
+        self.receipt(
+            "provider_authorization.cancelled",
+            &grant.id.to_string(),
+            "success",
+            "no-credentials-issued",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Removes only old, credential-free browser reservations. Any grant with
+    /// an activation journal is handled by `reconcile_grant_activations` and
+    /// can never take this deletion path.
+    fn reconcile_pending_provider_authorizations(&self) -> Result<()> {
+        let activation_grants = self
+            .grant_activation_operations()?
+            .into_iter()
+            .filter(|operation| operation.state != GrantActivationState::Completed)
+            .map(|operation| operation.grant_id)
+            .collect::<HashSet<_>>();
+        for grant in self.provider_grants()? {
+            if grant.status != crate::GrantStatus::AuthorizationPending
+                || activation_grants.contains(&grant.id)
+                || Utc::now() - grant.created_at < chrono::Duration::minutes(10)
+            {
+                continue;
+            }
+            let transaction = self.db.unchecked_transaction()?;
+            self.delete_row("provider_grants", grant.id)?;
+            self.receipt(
+                "provider_authorization.expired",
+                &grant.id.to_string(),
+                "success",
+                "credential-free-reservation",
+            )?;
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Confirms that the platform credential store can complete a full
+    /// write/read/delete cycle before an external provider is asked to mint a
+    /// credential. This does not eliminate platform failure, but prevents
+    /// beginning a browser flow against an already unavailable Keychain.
+    pub fn preflight_provider_credential_store(&self) -> Result<()> {
+        let label = format!("preflight/{}", Uuid::new_v4());
+        self.put_secret_value(&label, &SecretString::from(Uuid::new_v4().to_string()))?;
+        let verification = self.verify_secret_value(&label);
+        let deletion = self.delete_secret_value(&label);
+        verification.and(deletion)
+    }
+
+    /// Takes durable custody of every token returned by a completed browser
+    /// flow. A refresh-bearing response is never converted into an access-only
+    /// grant: it is immediately persisted as locally blocked with a durable,
+    /// retryable provider-cleanup operation.
+    pub fn complete_provider_authorization(
+        &self,
+        grant_id: Uuid,
+        access_token: &SecretString,
+        refresh_token: Option<&SecretString>,
+        scopes: Vec<String>,
+        access_expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<ProviderGrant> {
+        let mut grant = self
+            .provider_grant(grant_id)?
+            .context("provider authorization reservation was not found")?;
+        if grant.status != crate::GrantStatus::AuthorizationPending {
+            bail!("provider authorization reservation is no longer pending");
+        }
+        let mut activation = self
+            .grant_activation_operations()?
+            .into_iter()
+            .find(|operation| {
+                operation.grant_id == grant.id && operation.state != GrantActivationState::Completed
+            })
+            .context("provider token exchange was not journaled before issuance")?;
+        let refresh_reference = if refresh_token.is_some() {
+            activation.refresh_secret_ref.clone()
+        } else {
+            None
+        };
+        grant.refresh_secret_ref = refresh_reference.clone();
+        grant.scopes = scopes;
+        grant.access_expires_at = access_expires_at;
+        crate::oauth::validate_provider_grant(&grant)?;
+
+        activation.refresh_secret_ref = refresh_reference;
+        self.put("grant_activations", activation.id, &activation)?;
+
+        if let Err(error) = self.put_secret_value(&grant.access_secret_ref, access_token) {
+            activation.state = GrantActivationState::CleanupPending;
+            let _ = self.put("grant_activations", activation.id, &activation);
+            let _ = self.reconcile_grant_activations();
+            return Err(error.context(
+                "provider credential custody failed before activation; provider cleanup is required",
+            ));
+        }
+        if let (Some(reference), Some(token)) = (grant.refresh_secret_ref.as_deref(), refresh_token)
+            && let Err(error) = self.put_secret_value(reference, token)
+        {
+            activation.state = GrantActivationState::CleanupPending;
+            let _ = self.put("grant_activations", activation.id, &activation);
+            let _ = self.reconcile_grant_activations();
+            return Err(error.context(
+                "provider refresh credential custody failed; provider cleanup is required",
+            ));
+        }
+        activation.state = GrantActivationState::CredentialsWritten;
+        if let Err(error) = self.put("grant_activations", activation.id, &activation) {
+            let recovery = self.reconcile_grant_activations();
+            return match recovery {
+                Ok(()) => Err(error.context(
+                    "provider credential journal update failed; credentials were retained for retryable cleanup",
+                )),
+                Err(recovery_error) => Err(error.context(format!(
+                    "provider credential journal update failed and reconciliation remains pending: {recovery_error}"
+                ))),
+            };
+        }
+
+        let result = (|| {
+            let mut revocation = None;
+            grant.status = crate::GrantStatus::Active;
+            if grant.refresh_secret_ref.is_some() {
+                revocation = Some(crate::oauth::begin_revocation(&mut grant, Utc::now())?);
+            }
+            let transaction = self.db.unchecked_transaction()?;
+            self.put("provider_grants", grant.id, &grant)?;
+            if let Some(operation) = &revocation {
+                self.put("revocations", operation.id, operation)?;
+            }
+            activation.state = GrantActivationState::Completed;
+            activation.completed_at = Some(Utc::now());
+            self.put("grant_activations", activation.id, &activation)?;
+            self.receipt(
+                if revocation.is_some() {
+                    "provider_authorization.cleanup_required"
+                } else {
+                    "provider_grant.activated"
+                },
+                &grant.id.to_string(),
+                "success",
+                if revocation.is_some() {
+                    "all-issued-credentials-retained;local-use-blocked;provider-cleanup-pending"
+                } else {
+                    "access-only-credential-activated"
+                },
+            )?;
+            transaction.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = result {
+            // The activation journal and pending grant were committed before
+            // credential writes. Reconciliation promotes them to a blocked
+            // cleanup lifecycle rather than deleting an unrevoked credential.
+            let recovery = self.reconcile_grant_activations();
+            return match recovery {
+                Ok(()) => Err(error.context(
+                    "provider authorization could not activate; credentials were retained for retryable cleanup",
+                )),
+                Err(recovery_error) => Err(error.context(format!(
+                    "provider authorization could not activate and cleanup reconciliation remains pending: {recovery_error}"
+                ))),
+            };
+        }
+        self.provider_grant(grant.id)?
+            .context("completed provider grant was not found")
+    }
+
+    /// Marks that the one-shot token request is about to be submitted. This
+    /// journal is committed before external issuance can occur, closing the
+    /// exchange-success/process-crash window. The refresh reference is
+    /// preallocated because a conforming server may return a refresh token even
+    /// when active refresh use is disabled by Cargo policy.
+    pub fn begin_provider_token_exchange(&self, grant_id: Uuid) -> Result<()> {
+        let grant = self
+            .provider_grant(grant_id)?
+            .context("provider authorization reservation was not found")?;
+        if grant.status != crate::GrantStatus::AuthorizationPending {
+            bail!("provider authorization reservation is no longer pending");
+        }
+        if self.grant_activation_operations()?.iter().any(|operation| {
+            operation.grant_id == grant_id && operation.state != GrantActivationState::Completed
+        }) {
+            bail!("provider token exchange was already started");
+        }
+        let operation = GrantActivationOperation {
+            id: Uuid::new_v4(),
+            grant_id,
+            access_secret_ref: grant.access_secret_ref.clone(),
+            refresh_secret_ref: Some(crate::oauth::new_secret_reference(grant.id, "refresh")?),
+            state: GrantActivationState::Staged,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+        let transaction = self.db.unchecked_transaction()?;
+        self.put("grant_activations", operation.id, &operation)?;
+        self.receipt(
+            "provider_authorization.exchange_started",
+            &operation.id.to_string(),
+            "success",
+            "issuance-may-occur;credential-references-only",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Conservatively reconciles a token request whose outcome is ambiguous.
+    /// Once an exchange intent exists, no generic network or protocol error is
+    /// treated as proof that the provider minted nothing.
+    pub fn reconcile_provider_authorizations(&self) -> Result<()> {
+        self.reconcile_grant_activations()?;
+        self.reconcile_pending_provider_authorizations()
+    }
+
     /// Commits token custody and active grant metadata as a compensating
     /// transaction. Secret values are verified in Keychain before the encrypted
     /// grant record becomes Active; DB failure removes both staged credentials.
@@ -483,6 +812,11 @@ impl Vault {
         if self.provider_grant(grant.id)?.is_some() {
             bail!("provider grant already exists");
         }
+        if self.provider_grants()?.iter().any(|existing| {
+            existing.connection_id == grant.connection_id && !existing.status.is_terminal()
+        }) {
+            bail!("connection already has an unresolved provider authorization");
+        }
         let mut operation = GrantActivationOperation {
             id: Uuid::new_v4(),
             grant_id: grant.id,
@@ -502,14 +836,14 @@ impl Vault {
         )?;
         transaction.commit()?;
 
-        if let Err(error) = self.put_secret_value(&grant.access_secret_ref, access_token) {
+        if let Err(error) = self.put_secret_value(&grant.access_secret_ref, &access_token) {
             operation.state = GrantActivationState::CleanupPending;
             self.put("grant_activations", operation.id, &operation)?;
             self.reconcile_grant_activations()?;
             return Err(error);
         }
         if let (Some(reference), Some(token)) = (grant.refresh_secret_ref.as_deref(), refresh_token)
-            && let Err(error) = self.put_secret_value(reference, token)
+            && let Err(error) = self.put_secret_value(reference, &token)
         {
             operation.state = GrantActivationState::CleanupPending;
             self.put("grant_activations", operation.id, &operation)?;
@@ -552,14 +886,58 @@ impl Vault {
             if operation.state == GrantActivationState::Completed {
                 continue;
             }
-            if self.provider_grant(operation.grant_id)?.is_some() {
-                bail!("incomplete activation journal conflicts with an active provider grant");
+            if let Some(mut grant) = self.provider_grant(operation.grant_id)?
+                && grant.status == crate::GrantStatus::AuthorizationPending
+            {
+                // A credential-store write can return an ambiguous error after
+                // persisting. Once an issuance journal exists, never infer
+                // "no credentials" from the journal phase or delete custody.
+                // Inspect only to produce redacted recovery evidence; every
+                // issued reference is retained in a blocked cleanup lifecycle.
+                let access_present = self.secret_value_exists(&operation.access_secret_ref)?;
+                let refresh_present = operation
+                    .refresh_secret_ref
+                    .as_deref()
+                    .map(|reference| self.secret_value_exists(reference))
+                    .transpose()?
+                    .unwrap_or(false);
+                grant.access_secret_ref = operation.access_secret_ref.clone();
+                grant.refresh_secret_ref = operation.refresh_secret_ref.clone();
+                grant.status = crate::GrantStatus::Active;
+                let revocation = crate::oauth::begin_revocation(&mut grant, Utc::now())?;
+                operation.state = GrantActivationState::Completed;
+                operation.completed_at = Some(Utc::now());
+                let transaction = self.db.unchecked_transaction()?;
+                self.put("provider_grants", grant.id, &grant)?;
+                self.put("revocations", revocation.id, &revocation)?;
+                self.put("grant_activations", operation.id, &operation)?;
+                self.receipt(
+                    "provider_grant.activation_recovered",
+                    &operation.id.to_string(),
+                    "success",
+                    &format!(
+                        "local-use-blocked;provider-cleanup-pending;access-custody:{access_present};refresh-custody:{refresh_present}"
+                    ),
+                )?;
+                transaction.commit()?;
+                continue;
+            }
+            if let Some(grant) = self.provider_grant(operation.grant_id)?
+                && grant.status != crate::GrantStatus::AuthorizationPending
+            {
+                bail!("incomplete activation journal conflicts with a provider grant");
             }
             operation.state = GrantActivationState::CleanupPending;
             self.put("grant_activations", operation.id, &operation)?;
             self.delete_secret_value(&operation.access_secret_ref)?;
             if let Some(reference) = &operation.refresh_secret_ref {
                 self.delete_secret_value(reference)?;
+            }
+            if self
+                .provider_grant(operation.grant_id)?
+                .is_some_and(|grant| grant.status == crate::GrantStatus::AuthorizationPending)
+            {
+                self.delete_row("provider_grants", operation.grant_id)?;
             }
             operation.state = GrantActivationState::Completed;
             operation.completed_at = Some(Utc::now());
@@ -874,22 +1252,39 @@ impl Vault {
         }
     }
 
-    fn put_secret_value(&self, label: &str, secret: SecretString) -> Result<()> {
+    fn put_secret_value(&self, label: &str, secret: &SecretString) -> Result<()> {
         keyring::Entry::new(KEYRING_SERVICE, label)?.set_password(secret.expose_secret())?;
         self.verify_secret_value(label)
     }
 
     fn verify_secret_value(&self, label: &str) -> Result<()> {
-        let mut secret = Zeroizing::new(
-            keyring::Entry::new(KEYRING_SERVICE, label)?
-                .get_password()
-                .context("provider credential is missing from the OS credential store")?,
-        );
+        let mut secret = self.read_secret_value(label)?;
         if secret.is_empty() {
             bail!("provider credential is empty");
         }
         secret.zeroize();
         Ok(())
+    }
+
+    fn read_secret_value(&self, label: &str) -> Result<Zeroizing<String>> {
+        Ok(Zeroizing::new(
+            keyring::Entry::new(KEYRING_SERVICE, label)?
+                .get_password()
+                .context("provider credential is missing from the OS credential store")?,
+        ))
+    }
+
+    fn secret_value_exists(&self, label: &str) -> Result<bool> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, label)?;
+        match entry.get_password() {
+            Ok(mut value) => {
+                let present = !value.is_empty();
+                value.zeroize();
+                Ok(present)
+            }
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn delete_secret_value(&self, label: &str) -> Result<()> {
@@ -1318,6 +1713,265 @@ mod tests {
             crate::GrantStatus::RevocationPending
         );
         assert!(reopened.verify_receipt_chain().unwrap());
+    }
+
+    #[test]
+    fn activation_rejects_a_second_nonterminal_grant_for_one_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [43_u8; 32]).unwrap();
+        vault.create_profile("Uniqueness").unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: Default::default(),
+        };
+        vault.upsert_connection(&connection).unwrap();
+
+        let make_grant = |id| ProviderGrant {
+            id,
+            connection_id: connection.id,
+            resource: "https://mcp.example/resource".into(),
+            issuer: "https://issuer.example".into(),
+            client_id: "public-client".into(),
+            registration_kind: crate::ClientRegistrationKind::UserSuppliedPublic,
+            scopes: vec!["read".into()],
+            access_expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+            access_secret_ref: crate::oauth::new_secret_reference(id, "access").unwrap(),
+            refresh_secret_ref: None,
+            status: crate::GrantStatus::Active,
+            current_revocation_id: None,
+            revision: 0,
+            created_at: Utc::now(),
+            last_verified_at: None,
+        };
+        let first = make_grant(Uuid::new_v4());
+        vault
+            .activate_provider_grant(&first, SecretString::from("access-one"), None)
+            .unwrap();
+        let second = make_grant(Uuid::new_v4());
+        assert!(
+            vault
+                .activate_provider_grant(&second, SecretString::from("access-two"), None)
+                .is_err()
+        );
+        assert!(vault.provider_grant(second.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_issuance_is_custodied_and_locally_blocked_before_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [44_u8; 32]).unwrap();
+        vault.create_profile("Provisional custody").unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: Default::default(),
+        };
+        vault.upsert_connection(&connection).unwrap();
+        let grant_id = Uuid::new_v4();
+        let reservation = ProviderGrant {
+            id: grant_id,
+            connection_id: connection.id,
+            resource: "https://mcp.example/resource".into(),
+            issuer: "https://issuer.example".into(),
+            client_id: "public-client".into(),
+            registration_kind: crate::ClientRegistrationKind::UserSuppliedPublic,
+            scopes: vec!["read".into()],
+            access_expires_at: None,
+            access_secret_ref: crate::oauth::new_secret_reference(grant_id, "access").unwrap(),
+            refresh_secret_ref: None,
+            status: crate::GrantStatus::AuthorizationPending,
+            current_revocation_id: None,
+            revision: 0,
+            created_at: Utc::now(),
+            last_verified_at: None,
+        };
+        vault.reserve_provider_authorization(&reservation).unwrap();
+        vault.begin_provider_token_exchange(grant_id).unwrap();
+        let access = SecretString::from("access-token");
+        let refresh = SecretString::from("refresh-token");
+        let grant = vault
+            .complete_provider_authorization(
+                grant_id,
+                &access,
+                Some(&refresh),
+                vec!["read".into()],
+                Some(Utc::now() + chrono::Duration::minutes(5)),
+            )
+            .unwrap();
+        assert_eq!(grant.status, crate::GrantStatus::RevocationPending);
+        let operation_id = grant.current_revocation_id.unwrap();
+        let (_, stored_access, stored_refresh) = vault
+            .provider_credentials_for_revocation(operation_id)
+            .unwrap();
+        assert_eq!(stored_access.expose_secret(), "access-token");
+        assert_eq!(stored_refresh.unwrap().expose_secret(), "refresh-token");
+        vault.delete_secret_value(&grant.access_secret_ref).unwrap();
+        vault
+            .delete_secret_value(grant.refresh_secret_ref.as_deref().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn staged_issuance_journal_is_promoted_to_blocked_cleanup_not_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [45_u8; 32]).unwrap();
+        vault.create_profile("Crash recovery").unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: Default::default(),
+        };
+        vault.upsert_connection(&connection).unwrap();
+        let grant_id = Uuid::new_v4();
+        let access_ref = crate::oauth::new_secret_reference(grant_id, "access").unwrap();
+        let refresh_ref = crate::oauth::new_secret_reference(grant_id, "refresh").unwrap();
+        let reservation = ProviderGrant {
+            id: grant_id,
+            connection_id: connection.id,
+            resource: "https://mcp.example/resource".into(),
+            issuer: "https://issuer.example".into(),
+            client_id: "public-client".into(),
+            registration_kind: crate::ClientRegistrationKind::UserSuppliedPublic,
+            scopes: vec!["read".into()],
+            access_expires_at: None,
+            access_secret_ref: access_ref.clone(),
+            refresh_secret_ref: None,
+            status: crate::GrantStatus::AuthorizationPending,
+            current_revocation_id: None,
+            revision: 0,
+            created_at: Utc::now(),
+            last_verified_at: None,
+        };
+        vault.reserve_provider_authorization(&reservation).unwrap();
+        let activation = GrantActivationOperation {
+            id: Uuid::new_v4(),
+            grant_id,
+            access_secret_ref: access_ref.clone(),
+            refresh_secret_ref: Some(refresh_ref.clone()),
+            state: GrantActivationState::Staged,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+        vault
+            .put("grant_activations", activation.id, &activation)
+            .unwrap();
+        vault
+            .put_secret_value(&access_ref, &SecretString::from("access"))
+            .unwrap();
+        vault
+            .put_secret_value(&refresh_ref, &SecretString::from("refresh"))
+            .unwrap();
+        vault.reconcile_grant_activations().unwrap();
+        let recovered = vault.provider_grant(grant_id).unwrap().unwrap();
+        assert_eq!(recovered.status, crate::GrantStatus::RevocationPending);
+        assert_eq!(
+            recovered.refresh_secret_ref.as_deref(),
+            Some(refresh_ref.as_str())
+        );
+        assert!(recovered.current_revocation_id.is_some());
+        assert!(vault.cancel_provider_authorization(grant_id).is_err());
+        vault.delete_secret_value(&access_ref).unwrap();
+        vault.delete_secret_value(&refresh_ref).unwrap();
+    }
+
+    #[test]
+    fn stale_credential_free_authorization_reservation_expires() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [46_u8; 32]).unwrap();
+        vault.create_profile("Expiry").unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: Default::default(),
+        };
+        vault.upsert_connection(&connection).unwrap();
+        let grant_id = Uuid::new_v4();
+        vault
+            .reserve_provider_authorization(&ProviderGrant {
+                id: grant_id,
+                connection_id: connection.id,
+                resource: "https://mcp.example/resource".into(),
+                issuer: "https://issuer.example".into(),
+                client_id: "public-client".into(),
+                registration_kind: crate::ClientRegistrationKind::UserSuppliedPublic,
+                scopes: vec![],
+                access_expires_at: None,
+                access_secret_ref: crate::oauth::new_secret_reference(grant_id, "access").unwrap(),
+                refresh_secret_ref: None,
+                status: crate::GrantStatus::AuthorizationPending,
+                current_revocation_id: None,
+                revision: 0,
+                created_at: Utc::now() - chrono::Duration::minutes(11),
+                last_verified_at: None,
+            })
+            .unwrap();
+        vault.reconcile_pending_provider_authorizations().unwrap();
+        assert!(vault.provider_grant(grant_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn pre_exchange_intent_prevents_credential_free_expiry_after_crash() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::open_with_key(temp.path().join("vault.db"), [47_u8; 32]).unwrap();
+        vault.create_profile("Exchange crash").unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: Default::default(),
+        };
+        vault.upsert_connection(&connection).unwrap();
+        let grant_id = Uuid::new_v4();
+        vault
+            .reserve_provider_authorization(&ProviderGrant {
+                id: grant_id,
+                connection_id: connection.id,
+                resource: "https://mcp.example/resource".into(),
+                issuer: "https://issuer.example".into(),
+                client_id: "public-client".into(),
+                registration_kind: crate::ClientRegistrationKind::UserSuppliedPublic,
+                scopes: vec!["read".into()],
+                access_expires_at: None,
+                access_secret_ref: crate::oauth::new_secret_reference(grant_id, "access").unwrap(),
+                refresh_secret_ref: None,
+                status: crate::GrantStatus::AuthorizationPending,
+                current_revocation_id: None,
+                revision: 0,
+                created_at: Utc::now() - chrono::Duration::minutes(11),
+                last_verified_at: None,
+            })
+            .unwrap();
+        vault.begin_provider_token_exchange(grant_id).unwrap();
+        vault.reconcile_grant_activations().unwrap();
+        vault.reconcile_pending_provider_authorizations().unwrap();
+        let recovered = vault.provider_grant(grant_id).unwrap().unwrap();
+        assert_eq!(recovered.status, crate::GrantStatus::RevocationPending);
+        assert!(recovered.current_revocation_id.is_some());
     }
 
     #[cfg(unix)]

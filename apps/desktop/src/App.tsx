@@ -9,11 +9,13 @@ type MemoryRecord = { id: string; title: string; body: string; sensitivity: "pub
 type ImportResult = { connections_added: number; connections_skipped: number; memory_added: number; memory_skipped: number };
 type ImportPreview = { import_id: string; source_profile: string; exported_at: string; connections: Connection[]; memory: MemoryRecord[]; warnings: string[] };
 type Receipt = { id: string; action: string; target: string; outcome: string; record_hash: string; created_at: string };
+type ProviderGrant = { id: string; connection_id: string; resource: string; issuer: string; scopes: string[]; access_expires_at: string | null; status: string; created_at: string; last_verified_at: string | null };
+type ProviderPreview = { preview_id: string; resource: string; issuer: string; scopes_supported: string[]; refresh_persistence: string };
 type Plan = { plan_id: string; host: string; server_name: string; config_path: string; operation: string; creates_config: boolean; preimage_sha256: string | null; result_sha256: string; warnings: string[]; transport: string; command: string | null; args: string[]; url: string | null; secret_references: string[] };
-type AppState = { profile: Profile | null; hosts: Host[]; deployments: Deployment[]; connection_count: number; memory_count: number; receipts: Receipt[]; receipt_chain_valid: boolean; vault_path: string };
+type AppState = { profile: Profile | null; hosts: Host[]; deployments: Deployment[]; provider_grants: ProviderGrant[]; connection_count: number; memory_count: number; receipts: Receipt[]; receipt_chain_valid: boolean; vault_path: string };
 type View = "home" | "connections" | "memory" | "activity" | "privacy";
 
-const empty: AppState = { profile: null, hosts: [], deployments: [], connection_count: 0, memory_count: 0, receipts: [], receipt_chain_valid: true, vault_path: "" };
+const empty: AppState = { profile: null, hosts: [], deployments: [], provider_grants: [], connection_count: 0, memory_count: 0, receipts: [], receipt_chain_valid: true, vault_path: "" };
 
 export default function App() {
   const [state, setState] = useState<AppState>(empty);
@@ -44,6 +46,8 @@ export default function App() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [memoryToDelete, setMemoryToDelete] = useState<MemoryRecord | null>(null);
   const [connectionToDelete, setConnectionToDelete] = useState<Connection | null>(null);
+  const [providerTarget, setProviderTarget] = useState<Connection | null>(null);
+  const [providerPreview, setProviderPreview] = useState<ProviderPreview | null>(null);
 
   const refresh = async () => {
     const generation = vaultGeneration.current;
@@ -170,6 +174,8 @@ export default function App() {
       setRemovalPlan(null);
       setMemoryToDelete(null);
       setConnectionToDelete(null);
+      setProviderTarget(null);
+      setProviderPreview(null);
       setProfileOpen(false);
       setNotice("");
       setError("");
@@ -415,6 +421,57 @@ export default function App() {
     }
   };
 
+  const previewProvider = async (connection: Connection) => {
+    setBusy(true);
+    setError("");
+    try {
+      const preview = await invoke<ProviderPreview>("preview_provider_authorization", { connectionId: connection.id });
+      setProviderTarget(connection);
+      setProviderPreview(preview);
+      setBusy(false);
+    } catch (caught) {
+      setError(String(caught));
+      setBusy(false);
+    }
+  };
+
+  const connectProvider = async (clientId: string, scopes: string[]) => {
+    if (!providerTarget) return;
+    setBusy(true);
+    setError("");
+    try {
+      const grant = await invoke<ProviderGrant>("connect_provider", { previewId: providerPreview?.preview_id, clientId, scopes });
+      setNotice(grant.status === "active"
+        ? `Provider authorization connected for ${providerTarget.name}. The access token is held in Keychain.`
+        : `The provider issued a refresh credential Cargo cannot yet use safely. Every issued token is retained in Keychain, local use is blocked, and provider cleanup is pending.`);
+      setProviderTarget(null);
+      setProviderPreview(null);
+      await refresh();
+    } catch (caught) {
+      setError(String(caught));
+      await refresh();
+    }
+  };
+
+  const disconnectProvider = async (grant: ProviderGrant) => {
+    setBusy(true);
+    setError("");
+    try {
+      if (grant.status === "authorization_pending") {
+        await invoke("cancel_provider_authorization", { grantId: grant.id });
+        setNotice("The credential-free provider authorization reservation was cancelled.");
+        await refresh();
+        return;
+      }
+      const latest = await invoke<ProviderGrant>("disconnect_provider", { grantId: grant.id });
+      setNotice(latest.status === "verified_revoked" ? "Provider access was rejected, local credentials were deleted, and revocation is verified." : `Local provider use is blocked. Provider status: ${latest.status}. Cargo will not claim full revocation without evidence.`);
+      await refresh();
+    } catch (caught) {
+      setError(String(caught));
+      await refresh();
+    }
+  };
+
   if (locked) return <main className="lock-screen"><section><Mark /><span>LOCAL VAULT LOCKED</span><h1>The vault key is unloaded.</h1><p>Cargo cleared active UI state on a best-effort basis. JavaScript strings cannot be cryptographically erased from managed memory. Unlock reads the existing vault key from this Mac's Keychain; this soft lock does not require biometric presence.</p><button onClick={() => void unlock()} disabled={busy}>{busy ? "Unlocking…" : "Unlock local vault"}</button>{error && <div className="error">{error}</div>}</section></main>;
   if (busy && state.profile === null) return <main className="loading">Opening your local vault…</main>;
   if (openError && state.profile === null) return <main className="lock-screen"><section><Mark /><span>VAULT RECOVERY REQUIRED</span><h1>Cargo refused to replace your encryption key.</h1><p>The existing vault could not be opened. No new key or database was created. Restore the missing Keychain entry or a supported recovery artifact before continuing.</p><div className="error">{openError}</div></section></main>;
@@ -425,13 +482,13 @@ export default function App() {
 
   const connected = state.hosts.filter(host => host.exists).length;
   const activeDeployments = state.deployments.filter(item => item.state === "active");
-  const overlayOpen = Boolean(plan || exportMode || importOpen || backupOpen || encryptedImportOpen || importPreview || removalPlan || profileOpen || memoryToDelete || connectionToDelete);
+  const overlayOpen = Boolean(plan || exportMode || importOpen || backupOpen || encryptedImportOpen || importPreview || removalPlan || profileOpen || memoryToDelete || connectionToDelete || providerTarget);
   return <main className="shell">
     <aside inert={overlayOpen || busy}><div className="wordmark"><Mark /><b>CARGO</b><small>PRIVATE PREVIEW</small></div><nav>{([ ["home", "⌂", "Overview"], ["connections", "◇", "Connections"], ["memory", "◫", "Memory"], ["activity", "↗", "Receipts"], ["privacy", "◎", "Privacy"] ] as const).map(([id, icon, label]) => <button key={id} className={view === id ? "active" : ""} aria-current={view === id ? "page" : undefined} onClick={() => setView(id)}><i>{icon}</i>{label}</button>)}</nav><div className="local"><i>✓</i><div><b>Local-only mode</b><span>Soft-locks after 15 minutes</span></div><button onClick={() => void lock()} disabled={busy}>Lock</button></div></aside>
     <section className="workspace" inert={overlayOpen || busy}><header><div><button className="profile-button" onClick={() => setProfileOpen(true)}>{state.profile.display_name}'s vault</button><b>/</b><strong>{view[0].toUpperCase() + view.slice(1)}</strong></div><div><button className="secondary" onClick={() => setImportOpen(true)}>Import</button><button className="secondary" onClick={() => void beginExport("plain")}>Export portable pack</button><button onClick={() => void beginExport("encrypted")}>Export encrypted pack</button></div></header>
       <div className="content">{error && <div className="error" role="alert">{error}</div>}{notice && <div className="notice" role="status" aria-live="polite">{notice}<button aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
         {view === "home" && <><div className="heading"><span>DEVICE CONTROL PLANE / LOCAL</span><h1>Everything that makes AI yours.</h1><p>Your configurations and memory are encrypted on this Mac. Nothing here depends on a hosted Cargo service.</p></div><section className="metrics"><article className="hero"><span>LOCAL VAULT HEALTHY</span><strong>{connected}<small> / {state.hosts.length}</small></strong><h2>AI clients discovered</h2><p>Read-only discovery. Configuration changes always require a preview and approval.</p></article><article><span>CONNECTIONS</span><strong>{state.connection_count}</strong><p>Encrypted definitions</p></article><article><span>ACTIVE INSTALLS</span><strong>{activeDeployments.length}</strong><p>Reversible deployments</p></article></section><HostList hosts={state.hosts} onImport={importHost} /></>}
-        {view === "connections" && <Connections connections={connectionRecords} deployments={state.deployments} hosts={state.hosts} onImport={importHost} onPreview={previewInstall} onRevoke={previewRemoval} onDelete={setConnectionToDelete} />}
+        {view === "connections" && <Connections connections={connectionRecords} deployments={state.deployments} grants={state.provider_grants} hosts={state.hosts} onImport={importHost} onPreview={previewInstall} onRevoke={previewRemoval} onDelete={setConnectionToDelete} onAuthorize={previewProvider} onDisconnect={disconnectProvider} />}
         {view === "memory" && <MemoryView memory={memoryRecords} hosts={state.hosts} onSave={saveMemory} onDelete={setMemoryToDelete} />}
         {view === "activity" && <><div className="heading"><span>HASH-CHAINED RECEIPTS</span><h1>Every local action, accounted for.</h1><p>Records present in this vault: <b className={state.receipt_chain_valid ? "good" : "bad"}>{state.receipt_chain_valid ? "Internally consistent" : "Chain invalid"}</b>. Tail deletion requires a future external checkpoint to detect.</p></div><section className="receipts">{state.receipts.map(receipt => <article key={receipt.id}><time>{new Date(receipt.created_at).toLocaleString()}</time><div><b>{receipt.action}</b><span>{receipt.target}</span></div><strong>✓ {receipt.outcome}</strong></article>)}</section></>}
         {view === "privacy" && <><div className="heading"><span>ZERO-CUSTODY BY DEFAULT</span><h1>Your device is the boundary.</h1><p>Cargo's website cannot inspect, reset, or recover this vault.</p></div><section className="privacy-grid"><article><b>Encrypted records</b><p>Profile, connection, memory, deployment, and receipt documents use authenticated per-record encryption.</p></article><article><b>OS-protected key</b><p>The vault master key lives in macOS Keychain—not in the database or exported portable packs.</p></article><article><b>Portable by choice</b><p>Portable packs contain definitions and memory, never credentials. Passphrase encryption protects a pack in transit.</p></article><article><b>Transparent limits</b><p>The current encrypted pack is not a full-vault recovery: deployments, receipts, and Keychain credentials are excluded.</p></article></section><div className="path">Vault location <code>{state.vault_path}</code></div></>}
@@ -447,6 +504,7 @@ export default function App() {
     {profileOpen && <ProfileModal profile={state.profile} busy={busy} onClose={() => setProfileOpen(false)} onRename={renameProfile} />}
     {memoryToDelete && <DeleteRecordModal kind="memory" name={memoryToDelete.title} busy={busy} onClose={() => setMemoryToDelete(null)} onDelete={deleteMemory} />}
     {connectionToDelete && <DeleteRecordModal kind="connection" name={connectionToDelete.name} busy={busy} onClose={() => setConnectionToDelete(null)} onDelete={deleteConnection} />}
+    {providerTarget && providerPreview && <ProviderAuthorizationModal connection={providerTarget} preview={providerPreview} busy={busy} onClose={() => { setProviderTarget(null); setProviderPreview(null); }} onConnect={connectProvider} />}
   </main>;
 }
 
@@ -514,10 +572,10 @@ function HostList({ hosts, onImport }: { hosts: Host[]; onImport: (host: string)
   return <section className="hosts"><header><div><h2>AI clients on this Mac</h2><p>Supported documented configuration and official CLI surfaces</p></div><span>{hosts.filter(host => host.exists).length} discovered</span></header>{hosts.map(host => <article key={host.host}><div className="host-icon">{host.host[0]}</div><div><b>{host.host}</b><code>{host.path}</code></div>{host.can_import ? <button className="import" onClick={() => void onImport(host.host)}>Import definitions</button> : host.can_install ? <span className="found">✓ Official CLI ready</span> : <span className="not-found">○ Not found</span>}</article>)}</section>;
 }
 
-function Connections({ connections, deployments, hosts, onImport, onPreview, onRevoke, onDelete }: { connections: Connection[]; deployments: Deployment[]; hosts: Host[]; onImport: (host: string) => Promise<void>; onPreview: (connectionId: string, host: string) => Promise<void>; onRevoke: (deployment: Deployment) => Promise<void>; onDelete: (connection: Connection) => void }) {
+function Connections({ connections, deployments, grants, hosts, onImport, onPreview, onRevoke, onDelete, onAuthorize, onDisconnect }: { connections: Connection[]; deployments: Deployment[]; grants: ProviderGrant[]; hosts: Host[]; onImport: (host: string) => Promise<void>; onPreview: (connectionId: string, host: string) => Promise<void>; onRevoke: (deployment: Deployment) => Promise<void>; onDelete: (connection: Connection) => void; onAuthorize: (connection: Connection) => Promise<void>; onDisconnect: (grant: ProviderGrant) => Promise<void> }) {
   const destinations = hosts.filter(item => item.can_install);
   return <><div className="heading"><span>PORTABLE, REVERSIBLE CONNECTIONS</span><h1>Move definitions safely.</h1><p>Importing discards credential values. Installing previews one exact owned change; removal stops if that entry later drifts.</p></div>
-    {connections.length === 0 ? <section className="empty-state"><h2>No definitions in your vault yet.</h2><p>Import from a discovered AI client to begin. Credentials remain in the source client's store.</p><div>{hosts.filter(host => host.can_import).map(host => <button key={host.host} onClick={() => void onImport(host.host)}>Import from {host.host}</button>)}</div></section> : <section className="connection-list">{connections.map(connection => { const hasManagedDeployment = deployments.some(deployment => deployment.connection_id === connection.id && deployment.state !== "host_removed"); return <article key={connection.id}><div><span>{connection.transport.replace("_", " ")}</span><h2>{connection.name}</h2><p>{connection.command ?? connection.url}</p><small>Imported from {connection.metadata.source ?? "local pack"}</small></div><div className="connection-actions">{connection.environment_keys.length > 0 && <em>Authorization required: {connection.environment_keys.join(", ")}</em>}{destinations.map(host => { const nativeConnector = host.host === "Claude Desktop" && connection.transport !== "stdio"; return <button key={host.host} title={nativeConnector ? "Claude requires remote connectors to be added in its native Settings > Connectors interface." : undefined} disabled={connection.environment_keys.length > 0 || nativeConnector} onClick={() => void onPreview(connection.id, host.host)}>{nativeConnector ? "Use Claude Connectors" : `Install in ${host.host}`}</button>; })}<button className="text-danger" title={hasManagedDeployment ? "Resolve or remove every managed host deployment first." : "Delete this encrypted definition from Cargo."} disabled={hasManagedDeployment} onClick={() => onDelete(connection)}>{hasManagedDeployment ? "Resolve deployments first" : "Delete definition"}</button></div></article>; })}</section>}
+    {connections.length === 0 ? <section className="empty-state"><h2>No definitions in your vault yet.</h2><p>Import from a discovered AI client to begin. Credentials remain in the source client's store.</p><div>{hosts.filter(host => host.can_import).map(host => <button key={host.host} onClick={() => void onImport(host.host)}>Import from {host.host}</button>)}</div></section> : <section className="connection-list">{connections.map(connection => { const hasManagedDeployment = deployments.some(deployment => deployment.connection_id === connection.id && deployment.state !== "host_removed"); const grant = grants.find(item => item.connection_id === connection.id && item.status !== "verified_revoked"); const isRemote = connection.transport !== "stdio" && Boolean(connection.url); return <article key={connection.id}><div><span>{connection.transport.replace("_", " ")}</span><h2>{connection.name}</h2><p>{connection.command ?? connection.url}</p><small>Imported from {connection.metadata.source ?? "local pack"}</small>{grant && <div className="provider-status"><b>Provider / {grant.status.replaceAll("_", " ")}</b><small>{grant.issuer} · {grant.scopes.length ? grant.scopes.join(", ") : "default scope"}</small></div>}</div><div className="connection-actions">{connection.environment_keys.length > 0 && <em>Authorization required: {connection.environment_keys.join(", ")}</em>}{isRemote && !grant && <button onClick={() => void onAuthorize(connection)}>Authorize with Cargo</button>}{grant && !["verified_revoked", "local_cleanup_pending"].includes(grant.status) && <button className="text-danger" onClick={() => void onDisconnect(grant)}>{grant.status === "authorization_pending" ? "Cancel authorization" : "Disconnect provider"}</button>}{destinations.map(host => { const nativeConnector = host.host === "Claude Desktop" && connection.transport !== "stdio"; return <button key={host.host} title={nativeConnector ? "Claude requires remote connectors to be added in its native Settings > Connectors interface." : undefined} disabled={connection.environment_keys.length > 0 || nativeConnector} onClick={() => void onPreview(connection.id, host.host)}>{nativeConnector ? "Use Claude Connectors" : `Install in ${host.host}`}</button>; })}<button className="text-danger" title={hasManagedDeployment || Boolean(grant) ? "Resolve every managed deployment and provider authorization first." : "Delete this encrypted definition from Cargo."} disabled={hasManagedDeployment || Boolean(grant)} onClick={() => onDelete(connection)}>{hasManagedDeployment || grant ? "Resolve lifecycle first" : "Delete definition"}</button></div></article>; })}</section>}
     <div className="subheading"><span>MANAGED DEPLOYMENTS</span><h2>Registered installs and host removals</h2></div><section className="deployment-list">{deployments.length === 0 ? <p>No managed deployments yet.</p> : deployments.map(item => <article key={item.id}><div><b>{item.server_name}</b><span>{item.host}</span><code>{item.config_path}</code></div><strong className={`state ${item.state}`}>{item.state.replace("_", " ")}</strong>{(item.state === "active" || item.state === "local_blocked") && <button className="danger" onClick={() => void onRevoke(item)}>{item.state === "local_blocked" ? "Retry host removal" : "Remove from host"}</button>}</article>)}</section>
   </>;
 }
@@ -526,6 +584,17 @@ function PlanModal({ plan, busy, onClose, onApply }: { plan: Plan; busy: boolean
   const [reviewed, setReviewed] = useState(false);
   const dialogRef = useDialog(onClose, busy);
   return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal wide" role="dialog" aria-modal="true" aria-labelledby="plan-title"><span>UNTRUSTED EXECUTABLE DEFINITION</span><h2 id="plan-title">Review exactly what {plan.host} will run.</h2><p>Portable connection definitions are configuration—not trusted software. Cargo will register the following without executing it itself.</p><div className="execution-preview"><b>{plan.transport === "stdio" ? "Command" : "Remote endpoint"}</b>{plan.command && <code>{plan.command}</code>}{plan.url && <code>{plan.url}</code>}{plan.args.length > 0 && <><b>Arguments, in order</b><ol>{plan.args.map((argument, index) => <li key={`${index}-${argument}`}><code>{argument}</code></li>)}</ol></>}{plan.secret_references.length > 0 && <p>Credential references: {plan.secret_references.join(", ")}</p>}</div><p>Cargo will {plan.creates_config ? "create" : "rewrite"} this file after one final fingerprint check:</p><code>{plan.config_path}</code><dl><div><dt>Current file</dt><dd>{plan.preimage_sha256 ? `${plan.preimage_sha256.slice(0, 16)}…` : "Does not exist"}</dd></div><div><dt>Planned result</dt><dd>{plan.result_sha256.slice(0, 16)}…</dd></div></dl><ul>{plan.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul><label className="confirm"><input type="checkbox" checked={reviewed} onChange={event => setReviewed(event.target.checked)} />I reviewed the executable or endpoint and every argument above.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button onClick={() => void onApply()} disabled={!reviewed || busy}>{busy ? "Applying…" : `Install in ${plan.host}`}</button></div></section></div>;
+}
+
+function ProviderAuthorizationModal({ connection, preview, busy, onClose, onConnect }: { connection: Connection; preview: ProviderPreview; busy: boolean; onClose: () => void; onConnect: (clientId: string, scopes: string[]) => Promise<void> }) {
+  const [clientId, setClientId] = useState("");
+  const [scopes, setScopes] = useState<string[]>([]);
+  const [customScopes, setCustomScopes] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
+  const dialogRef = useDialog(onClose, busy);
+  const selectedScopes = preview.scopes_supported.length ? scopes : customScopes.split(/[ ,]+/).map(value => value.trim()).filter(Boolean);
+  const toggleScope = (scope: string) => setScopes(current => current.includes(scope) ? current.filter(item => item !== scope) : [...current, scope]);
+  return <div className="modal-backdrop" role="presentation"><section ref={dialogRef} tabIndex={-1} className="modal wide" role="dialog" aria-modal="true" aria-labelledby="provider-auth-title"><span>REMOTE MCP AUTHORIZATION / PREVIEW</span><h2 id="provider-auth-title">Authorize {connection.name} in your system browser.</h2><p>Cargo validated the resource and authorization server before showing this dialog. The callback code, PKCE verifier, and tokens remain inside Rust; the renderer receives only this safe metadata.</p><dl><div><dt>Resource</dt><dd>{preview.resource}</dd></div><div><dt>Issuer</dt><dd>{preview.issuer}</dd></div><div><dt>Refresh policy</dt><dd>{preview.refresh_persistence.replaceAll("-", " ").replaceAll(";", "; ")}</dd></div></dl><label>Public client ID<input value={clientId} maxLength={2048} autoComplete="off" onChange={event => setClientId(event.target.value)} placeholder="Provider-issued public client ID" /></label>{preview.scopes_supported.length ? <fieldset className="scope-picker"><legend>Requested scopes</legend>{preview.scopes_supported.map(scope => <label key={scope}><input type="checkbox" checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} />{scope}</label>)}</fieldset> : <label>Requested scopes<input value={customScopes} onChange={event => setCustomScopes(event.target.value)} placeholder="Optional, separated by spaces" /></label>}<p>After consent, Cargo stores the access token in this device’s credential store. If the provider also issues a refresh token, Cargo stores it only in OS Keychain, blocks it from active use, and retains it solely until provider cleanup is resolved. Tokens never enter AI-client configuration, portable packs, receipts, logs, or this webview.</p><label className="confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I verified the resource, issuer, public client ID, and scopes, and understand the possible cleanup-only refresh-token custody described above.</label><div className="modal-actions"><button className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button onClick={() => void onConnect(clientId.trim(), selectedScopes)} disabled={busy || !clientId.trim() || !confirmed}>{busy ? "Waiting for browser consent…" : "Open system browser and connect"}</button></div></section></div>;
 }
 
 function MemoryView({ memory, hosts, onSave, onDelete }: { memory: MemoryRecord[]; hosts: Host[]; onSave: (memoryId: string | null, title: string, body: string, sensitivity: string, allowedHosts: string[]) => Promise<void>; onDelete: (memory: MemoryRecord) => void }) {

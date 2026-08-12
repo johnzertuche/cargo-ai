@@ -21,7 +21,7 @@ Network discovery uses response/time caps, zero redirects, recursive duplicate-k
 
 Future token values are stored only under opaque, grant-scoped operating-system credential references. Provider-grant records may contain issuer, resource, public client ID, scopes, expiry, lifecycle state, and opaque references; they may never contain access/refresh token values. Tokens may be leased only inside the Rust HTTP transport, bound to one resource and required scopes, and sent only in the `Authorization` header. Renderer, CLI, logs, receipts, crash diagnostics, connection definitions, and portable packs never receive them.
 
-Refresh requires single-flight synchronization and atomic rotation. If a public client receives neither sender-constrained nor rotating refresh tokens, Cargo must not persist that refresh token and must require reauthorization after access expiry.
+Refresh requires single-flight synchronization and atomic rotation. Cargo does not activate or use a refresh token until provider rotation or sender constraint is proven. If an authorization response nevertheless issues one, Cargo retains it in the operating-system credential store only inside a locally blocked, durable provider-cleanup lifecycle; it is never silently discarded or converted into an access-only grant. Active refresh persistence remains disabled and access expiry requires reauthorization.
 
 ## Revocation evidence
 
