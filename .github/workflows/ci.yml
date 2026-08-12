@@ -18,7 +18,7 @@ jobs:
     name: Rust core and desktop boundary
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Clippy
@@ -30,8 +30,8 @@ jobs:
     name: Website and desktop renderer
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22.22.0
           cache: npm
@@ -55,7 +55,7 @@ jobs:
     name: RustSec audit for the macOS preview
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Reject vulnerabilities, yanked crates, and macOS unsoundness
