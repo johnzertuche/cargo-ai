@@ -15,10 +15,12 @@ test("production server applies browser security headers", async (t) => {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       response = await fetch(`http://127.0.0.1:${port}/`);
-      break;
+      if (response.status === 200) break;
+      await response.arrayBuffer();
     } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      response = undefined;
     }
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 
   assert.ok(response, "production server did not become ready");
