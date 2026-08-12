@@ -11,7 +11,7 @@ repository = "https://github.com/johnzertuche/cargo-ai"
 [workspace.dependencies]
 age = { version = "0.11", features = ["armor"] }
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
