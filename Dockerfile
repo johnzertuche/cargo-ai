@@ -11,6 +11,7 @@ COPY build ./build
 COPY public ./public
 COPY worker ./worker
 COPY next-env.d.ts next.config.ts postcss.config.mjs tsconfig.json vite.config.ts ./
+COPY server.mjs ./
 RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime
