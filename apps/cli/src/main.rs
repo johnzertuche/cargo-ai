@@ -1,12 +1,16 @@
 use anyhow::Result;
 use cargo_ai_core::{
-    MemoryRecord, Sensitivity, Vault,
+    ClientRegistrationKind, GrantStatus, MemoryRecord, ProviderGrant, RevocationVerification,
+    Sensitivity, TokenRevocationResult, Vault,
     adapters::discover_known,
     host_ops::{
         apply_recorded_install, apply_recorded_removal, inspect_host_configuration, plan_install,
         plan_removal,
     },
     mutation::write_private_file,
+    oauth::{AuthorizationTransaction, OAuthProviderTransport, TokenKind, new_secret_reference},
+    oauth_callback::LoopbackCallback,
+    oauth_http::HttpOAuthTransport,
     transfer::{decrypt_pack, encrypt_pack},
 };
 use chrono::Utc;
@@ -15,6 +19,7 @@ use std::{
     fs,
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
 };
 use uuid::Uuid;
 
@@ -78,6 +83,10 @@ enum Command {
         )]
         yes: bool,
     },
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     ExportSafe {
         output: PathBuf,
     },
@@ -111,6 +120,34 @@ enum Command {
         command: MemoryCommand,
     },
     Receipts,
+}
+
+#[derive(Subcommand)]
+enum ProviderCommand {
+    List,
+    Authorize {
+        connection_id: Uuid,
+        #[arg(long)]
+        client_id: String,
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        #[arg(
+            long,
+            help = "Proceed after printing the exact authorization preview without typed confirmation"
+        )]
+        yes: bool,
+    },
+    Disconnect {
+        grant_id: Uuid,
+        #[arg(
+            long,
+            help = "Proceed after printing the provider lifecycle state without typed confirmation"
+        )]
+        yes: bool,
+    },
+    Cancel {
+        grant_id: Uuid,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +273,243 @@ fn redacted_connection_previews(
         .collect()
 }
 
+fn provider_grant_preview(grant: &ProviderGrant) -> serde_json::Value {
+    serde_json::json!({
+        "id": grant.id,
+        "connection_id": grant.connection_id,
+        "resource": grant.resource,
+        "issuer": grant.issuer,
+        "scopes": grant.scopes,
+        "access_expires_at": grant.access_expires_at,
+        "status": grant.status,
+        "has_refresh_credential": grant.refresh_secret_ref.is_some(),
+        "created_at": grant.created_at,
+        "last_verified_at": grant.last_verified_at,
+        "secret_values_redacted": true,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_authorization_url(url: &url::Url) -> Result<()> {
+    let status = ProcessCommand::new("/usr/bin/open")
+        .env_clear()
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("the system browser launcher rejected the authorization URL");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_authorization_url(_url: &url::Url) -> Result<()> {
+    anyhow::bail!("CLI provider authorization is currently enabled only on macOS")
+}
+
+fn authorize_provider(
+    vault: &Vault,
+    connection_id: Uuid,
+    client_id: String,
+    scopes: Vec<String>,
+    yes: bool,
+) -> Result<()> {
+    let connection = vault
+        .connection(connection_id)?
+        .ok_or_else(|| anyhow::anyhow!("connection not found"))?;
+    let resource = connection
+        .url
+        .as_deref()
+        .filter(|_| connection.transport != "stdio")
+        .ok_or_else(|| anyhow::anyhow!("only remote HTTP MCP definitions can be authorized"))?;
+    if vault
+        .provider_grants()?
+        .iter()
+        .any(|grant| grant.connection_id == connection_id && !grant.status.is_terminal())
+    {
+        anyhow::bail!("connection already has an unresolved provider authorization");
+    }
+    let mut transport = HttpOAuthTransport::discover(resource)?;
+    let preview = serde_json::json!({
+        "connection": connection.name,
+        "resource": transport.metadata().resource,
+        "issuer": transport.metadata().issuer,
+        "authorization_endpoint": transport.metadata().authorization_endpoint,
+        "client_id": client_id,
+        "requested_scopes": scopes,
+        "supported_scopes": transport.metadata().scopes_supported,
+        "client_type": "public",
+        "refresh_policy": "active use disabled; any issued refresh credential is retained only in Keychain for blocked provider cleanup",
+    });
+    eprintln!("Review the exact provider authorization boundary. No token value will be printed:");
+    println!("{}", serde_json::to_string_pretty(&preview)?);
+    require_confirmation("AUTHORIZE", yes)?;
+
+    let grant_id = Uuid::new_v4();
+    let pending = ProviderGrant {
+        id: grant_id,
+        connection_id,
+        resource: transport.metadata().resource.to_string(),
+        issuer: transport.metadata().issuer.to_string(),
+        client_id: client_id.trim().to_owned(),
+        registration_kind: ClientRegistrationKind::UserSuppliedPublic,
+        scopes: scopes.clone(),
+        access_expires_at: None,
+        access_secret_ref: new_secret_reference(grant_id, "access")?,
+        refresh_secret_ref: None,
+        status: GrantStatus::AuthorizationPending,
+        current_revocation_id: None,
+        revision: 0,
+        created_at: Utc::now(),
+        last_verified_at: None,
+    };
+    let mut callback = LoopbackCallback::bind()?;
+    vault.preflight_provider_credential_store()?;
+    vault.reserve_provider_authorization(&pending)?;
+    let flow = (|| {
+        let mut transaction = AuthorizationTransaction::new(
+            transport.metadata(),
+            client_id.trim(),
+            callback.redirect_uri().clone(),
+            scopes,
+        )?;
+        open_authorization_url(&transaction.authorization_url())?;
+        eprintln!(
+            "The validated authorization URL opened in your system browser. Cargo is listening only on {}. The state and PKCE values were not printed.",
+            callback.redirect_uri()
+        );
+        let exchange = callback.receive_exchange(&mut transaction)?;
+        vault.begin_provider_token_exchange(grant_id)?;
+        match transport.exchange(exchange) {
+            Ok(issued) => Ok(issued),
+            Err(error) => {
+                vault.reconcile_provider_authorizations()?;
+                Err(error.context(
+                    "token exchange outcome is ambiguous; Cargo retained a locally blocked cleanup record",
+                ))
+            }
+        }
+    })();
+    let issued = match flow {
+        Ok(issued) => issued,
+        Err(error) => {
+            if !vault
+                .provider_grant(grant_id)?
+                .is_some_and(|grant| grant.current_revocation_id.is_some())
+            {
+                vault.cancel_provider_authorization(grant_id)?;
+            }
+            return Err(error);
+        }
+    };
+    let expires_at = issued.expires_at;
+    let granted_scopes = issued.scopes.clone();
+    let (access, refresh) = issued.into_secrets();
+    let grant = match vault.complete_provider_authorization(
+        grant_id,
+        &access,
+        refresh.as_ref(),
+        granted_scopes,
+        Some(expires_at),
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            if let Some(refresh) = &refresh {
+                let _ = transport.revoke(refresh, TokenKind::Refresh);
+            }
+            let _ = transport.revoke(&access, TokenKind::Access);
+            return Err(error.context(
+                "authorization was not activated; immediate provider cleanup was attempted without claiming verification",
+            ));
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&provider_grant_preview(&grant))?
+    );
+    Ok(())
+}
+
+fn disconnect_provider(vault: &Vault, grant_id: Uuid, yes: bool) -> Result<()> {
+    let grant = vault
+        .provider_grant(grant_id)?
+        .ok_or_else(|| anyhow::anyhow!("provider grant not found"))?;
+    eprintln!(
+        "Review the provider lifecycle state. Local use is blocked before network I/O; RFC 7009 acceptance alone is never called verified:"
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&provider_grant_preview(&grant))?
+    );
+    require_confirmation("DISCONNECT", yes)?;
+    let (grant, access, refresh, operation_id) = if let Some(operation_id) =
+        grant.current_revocation_id
+    {
+        let (owned, access, refresh) = vault.provider_credentials_for_revocation(operation_id)?;
+        (owned, access, refresh, operation_id)
+    } else {
+        let (access, refresh) = vault.provider_credentials_for_transport(grant_id)?;
+        let operation = vault.begin_provider_revocation(grant_id)?;
+        (grant, access, refresh, operation.id)
+    };
+    let network = (|| {
+        let mut transport = HttpOAuthTransport::discover(&grant.resource)?;
+        if transport.metadata().issuer.as_str() != grant.issuer {
+            anyhow::bail!("provider issuer changed");
+        }
+        let refresh_result = if let Some(refresh) = &refresh {
+            transport.revoke(refresh, TokenKind::Refresh)?
+        } else {
+            TokenRevocationResult::NotAttempted
+        };
+        let access_result = transport.revoke(&access, TokenKind::Access)?;
+        let verification = transport.probe_resource(&access, &transport.metadata().resource)?;
+        Ok::<_, anyhow::Error>((access_result, refresh_result, verification))
+    })();
+    let latest = match network {
+        Ok((access_result, refresh_result, verification)) => {
+            vault.record_provider_revocation_attempt(
+                operation_id,
+                access_result,
+                refresh_result,
+                None,
+                None,
+            )?;
+            let evidence = if verification == RevocationVerification::ResourceRejected
+                && grant.refresh_secret_ref.is_none()
+            {
+                RevocationVerification::AllIssuedTokensInactive
+            } else {
+                verification
+            };
+            let verified = vault.record_provider_revocation_verification(operation_id, evidence)?;
+            if verified.status == GrantStatus::LocalCleanupPending {
+                vault.finalize_provider_revocation(operation_id)?
+            } else {
+                verified
+            }
+        }
+        Err(_) => vault.record_provider_revocation_attempt(
+            operation_id,
+            TokenRevocationResult::RetryableFailure,
+            if grant.refresh_secret_ref.is_some() {
+                TokenRevocationResult::RetryableFailure
+            } else {
+                TokenRevocationResult::NotAttempted
+            },
+            Some(Utc::now() + chrono::Duration::minutes(5)),
+            Some("provider_network_failed"),
+        )?,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&provider_grant_preview(&latest))?
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = cli.vault.unwrap_or(Vault::default_path()?);
@@ -333,6 +607,28 @@ fn main() -> Result<()> {
                 )?)?
             );
         }
+        Command::Provider { command } => match command {
+            ProviderCommand::List => {
+                let grants = vault
+                    .provider_grants()?
+                    .iter()
+                    .map(provider_grant_preview)
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&grants)?)
+            }
+            ProviderCommand::Authorize {
+                connection_id,
+                client_id,
+                scopes,
+                yes,
+            } => authorize_provider(&vault, connection_id, client_id, scopes, yes)?,
+            ProviderCommand::Disconnect { grant_id, yes } => {
+                disconnect_provider(&vault, grant_id, yes)?
+            }
+            ProviderCommand::Cancel { grant_id } => {
+                vault.cancel_provider_authorization(grant_id)?
+            }
+        },
         Command::ExportSafe { output } => {
             write_private_file(&output, &serde_json::to_vec_pretty(&vault.export_safe()?)?)?
         }
@@ -486,6 +782,24 @@ mod tests {
         assert!(matches!(
             connections.command,
             Command::Connections { show_values: false }
+        ));
+
+        let provider = Cli::try_parse_from([
+            "cargo-ai",
+            "provider",
+            "authorize",
+            &connection_id.to_string(),
+            "--client-id",
+            "public-client",
+            "--scope",
+            "tools.read",
+        ])
+        .unwrap();
+        assert!(matches!(
+            provider.command,
+            Command::Provider {
+                command: ProviderCommand::Authorize { yes: false, .. }
+            }
         ));
     }
 }

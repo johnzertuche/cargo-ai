@@ -129,11 +129,23 @@ impl Vault {
           CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS provider_grants (id TEXT PRIMARY KEY, document BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS provider_lifecycle_owners (
+            connection_id TEXT PRIMARY KEY,
+            grant_id TEXT NOT NULL UNIQUE
+          );
           CREATE TABLE IF NOT EXISTS grant_activations (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS revocations (id TEXT PRIMARY KEY, document BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         "#,
         )?;
+        // Backfill lifecycle ownership for existing encrypted grant records.
+        // Conflicting legacy rows are surfaced instead of silently choosing an
+        // owner, because that state requires explicit reconciliation.
+        for grant in self.provider_grants()? {
+            if !grant.status.is_terminal() {
+                self.claim_provider_lifecycle(grant.connection_id, grant.id)?;
+            }
+        }
         Ok(())
     }
 
@@ -427,6 +439,33 @@ impl Vault {
         self.by_id("provider_grants", id)
     }
 
+    fn claim_provider_lifecycle(&self, connection_id: Uuid, grant_id: Uuid) -> Result<()> {
+        let changed = self.db.execute(
+            "INSERT INTO provider_lifecycle_owners(connection_id, grant_id) VALUES (?1, ?2) \
+             ON CONFLICT(connection_id) DO NOTHING",
+            params![connection_id.to_string(), grant_id.to_string()],
+        )?;
+        if changed == 0 {
+            let owner: String = self.db.query_row(
+                "SELECT grant_id FROM provider_lifecycle_owners WHERE connection_id=?1",
+                params![connection_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if owner != grant_id.to_string() {
+                bail!("connection already has an unresolved provider authorization");
+            }
+        }
+        Ok(())
+    }
+
+    fn release_provider_lifecycle(&self, connection_id: Uuid, grant_id: Uuid) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM provider_lifecycle_owners WHERE connection_id=?1 AND grant_id=?2",
+            params![connection_id.to_string(), grant_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Loads credential material only for a Rust transport operation. Callers
     /// must never serialize, log, or return these values across an IPC boundary.
     pub fn provider_credentials_for_transport(
@@ -537,23 +576,31 @@ impl Vault {
         if self.connection(grant.connection_id)?.is_none() {
             bail!("provider grant references an unknown connection");
         }
-        if self.provider_grant(grant.id)?.is_some()
-            || self.provider_grants()?.iter().any(|existing| {
-                existing.connection_id == grant.connection_id && !existing.status.is_terminal()
-            })
-        {
+        if self.provider_grant(grant.id)?.is_some() {
             bail!("connection already has an unresolved provider authorization");
         }
-        let transaction = self.db.unchecked_transaction()?;
-        self.put("provider_grants", grant.id, grant)?;
-        self.receipt(
-            "provider_authorization.reserved",
-            &grant.id.to_string(),
-            "success",
-            "no-credentials-issued",
-        )?;
-        transaction.commit()?;
-        Ok(())
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.claim_provider_lifecycle(grant.connection_id, grant.id)?;
+            self.put("provider_grants", grant.id, grant)?;
+            self.receipt(
+                "provider_authorization.reserved",
+                &grant.id.to_string(),
+                "success",
+                "no-credentials-issued",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Removes a browser-flow reservation only while it is still known to
@@ -572,16 +619,28 @@ impl Vault {
         }) {
             bail!("provider authorization has entered credential custody and must be revoked");
         }
-        let transaction = self.db.unchecked_transaction()?;
-        self.delete_row("provider_grants", grant.id)?;
-        self.receipt(
-            "provider_authorization.cancelled",
-            &grant.id.to_string(),
-            "success",
-            "no-credentials-issued",
-        )?;
-        transaction.commit()?;
-        Ok(())
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.delete_row("provider_grants", grant.id)?;
+            self.release_provider_lifecycle(grant.connection_id, grant.id)?;
+            self.receipt(
+                "provider_authorization.cancelled",
+                &grant.id.to_string(),
+                "success",
+                "no-credentials-issued",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Removes only old, credential-free browser reservations. Any grant with
@@ -603,6 +662,7 @@ impl Vault {
             }
             let transaction = self.db.unchecked_transaction()?;
             self.delete_row("provider_grants", grant.id)?;
+            self.release_provider_lifecycle(grant.connection_id, grant.id)?;
             self.receipt(
                 "provider_authorization.expired",
                 &grant.id.to_string(),
@@ -937,6 +997,9 @@ impl Vault {
                 .provider_grant(operation.grant_id)?
                 .is_some_and(|grant| grant.status == crate::GrantStatus::AuthorizationPending)
             {
+                if let Some(grant) = self.provider_grant(operation.grant_id)? {
+                    self.release_provider_lifecycle(grant.connection_id, grant.id)?;
+                }
                 self.delete_row("provider_grants", operation.grant_id)?;
             }
             operation.state = GrantActivationState::Completed;
@@ -998,6 +1061,9 @@ impl Vault {
         let transaction = self.db.unchecked_transaction()?;
         self.put("provider_grants", grant.id, &grant)?;
         self.put("revocations", operation.id, &operation)?;
+        if grant.status.is_terminal() {
+            self.release_provider_lifecycle(grant.connection_id, grant.id)?;
+        }
         self.receipt(
             "provider_revocation.attempted",
             &operation.id.to_string(),
@@ -1023,6 +1089,9 @@ impl Vault {
         let transaction = self.db.unchecked_transaction()?;
         self.put("provider_grants", grant.id, &grant)?;
         self.put("revocations", operation.id, &operation)?;
+        if grant.status.is_terminal() {
+            self.release_provider_lifecycle(grant.connection_id, grant.id)?;
+        }
         self.receipt(
             "provider_revocation.verified",
             &operation.id.to_string(),
@@ -1056,6 +1125,7 @@ impl Vault {
         let transaction = self.db.unchecked_transaction()?;
         self.put("provider_grants", grant.id, &grant)?;
         self.put("revocations", operation.id, &operation)?;
+        self.release_provider_lifecycle(grant.connection_id, grant.id)?;
         self.receipt(
             "provider_revocation.local_cleanup_complete",
             &operation.id.to_string(),
@@ -1972,6 +2042,59 @@ mod tests {
         let recovered = vault.provider_grant(grant_id).unwrap().unwrap();
         assert_eq!(recovered.status, crate::GrantStatus::RevocationPending);
         assert!(recovered.current_revocation_id.is_some());
+    }
+
+    #[test]
+    fn separate_vault_handles_enforce_one_unresolved_provider_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let first = Vault::open_with_key(&path, [48_u8; 32]).unwrap();
+        first.create_profile("Multi process").unwrap();
+        let connection = ConnectionDefinition {
+            id: Uuid::new_v4(),
+            name: "remote".into(),
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example/resource".into()),
+            environment_keys: vec![],
+            metadata: Default::default(),
+        };
+        first.upsert_connection(&connection).unwrap();
+        let second = Vault::open_with_key(&path, [48_u8; 32]).unwrap();
+        let make_pending = |id| ProviderGrant {
+            id,
+            connection_id: connection.id,
+            resource: "https://mcp.example/resource".into(),
+            issuer: "https://issuer.example".into(),
+            client_id: "public-client".into(),
+            registration_kind: crate::ClientRegistrationKind::UserSuppliedPublic,
+            scopes: vec![],
+            access_expires_at: None,
+            access_secret_ref: crate::oauth::new_secret_reference(id, "access").unwrap(),
+            refresh_secret_ref: None,
+            status: crate::GrantStatus::AuthorizationPending,
+            current_revocation_id: None,
+            revision: 0,
+            created_at: Utc::now(),
+            last_verified_at: None,
+        };
+        let first_grant = make_pending(Uuid::new_v4());
+        let second_grant = make_pending(Uuid::new_v4());
+        first.reserve_provider_authorization(&first_grant).unwrap();
+        assert!(
+            second
+                .reserve_provider_authorization(&second_grant)
+                .is_err()
+        );
+        assert!(second.provider_grant(second_grant.id).unwrap().is_none());
+        first.cancel_provider_authorization(first_grant.id).unwrap();
+        second
+            .reserve_provider_authorization(&second_grant)
+            .unwrap();
+        second
+            .cancel_provider_authorization(second_grant.id)
+            .unwrap();
     }
 
     #[cfg(unix)]

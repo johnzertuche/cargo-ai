@@ -523,6 +523,7 @@ dependencies = [
  "clap",
  "rpassword",
  "serde_json",
+ "url",
  "uuid",
 ]
 

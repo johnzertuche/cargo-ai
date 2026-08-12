@@ -1132,8 +1132,16 @@ mod tests {
     #[test]
     fn http_conformance_covers_exchange_rotation_replay_and_revocation() {
         let provider = FakeProvider::start();
-        let mut transport =
-            HttpOAuthTransport::discover_test_loopback(provider.resource().as_str()).unwrap();
+        let mut transport = (0..20)
+            .find_map(|_| {
+                let result =
+                    HttpOAuthTransport::discover_test_loopback(provider.resource().as_str());
+                if result.is_err() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                result.ok()
+            })
+            .expect("fake OAuth provider did not become ready");
 
         let issued = authorize_flow(&provider, &transport);
         let (access_one, refresh_one) = issued.into_secrets();
