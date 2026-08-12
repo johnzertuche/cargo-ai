@@ -28,6 +28,8 @@ test("server-renders the Cargo public landing page", async () => {
 test("publishes accurate social and security metadata", async () => {
   const html = await (await render()).text();
   assert.match(html, /cargo-og\.png/);
+  assert.match(html, /https:\/\/cargo-ai-production\.up\.railway\.app\/cargo-og\.png/);
+  assert.doesNotMatch(html, /localhost:3000/);
   assert.match(html, /Open-source, local-first AI portability/);
   assert.match(html, /johnzertuche\/cargo-ai/);
   assert.match(html, /Read the security model/);

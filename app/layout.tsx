@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000"),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "https://cargo-ai-production.up.railway.app"),
   title: "Cargo — Your AI life, owned by you",
   description: "An open-source, local-first encrypted vault for carrying AI connections and memory between Claude, Cursor, and Codex.",
   openGraph: {
