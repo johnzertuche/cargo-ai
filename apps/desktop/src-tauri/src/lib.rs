@@ -544,6 +544,30 @@ fn disconnect_provider(
 }
 
 #[tauri::command]
+fn finalize_provider_cleanup(
+    grant_id: String,
+    app: State<AppRuntime>,
+) -> Result<ProviderGrantView, String> {
+    let grant_id = Uuid::parse_str(&grant_id).map_err(err)?;
+    let session = active_vault(&app)?;
+    let vault = vault_ref(&session)?;
+    let grant = vault
+        .provider_grant(grant_id)
+        .map_err(err)?
+        .ok_or("Provider grant was not found")?;
+    if grant.status != GrantStatus::LocalCleanupPending {
+        return Err("Provider verification is not waiting for local cleanup".into());
+    }
+    let operation_id = grant
+        .current_revocation_id
+        .ok_or("Provider cleanup operation was not found")?;
+    vault
+        .finalize_provider_revocation(operation_id)
+        .map(ProviderGrantView::from)
+        .map_err(err)
+}
+
+#[tauri::command]
 fn memory_records(app: State<'_, AppRuntime>) -> Result<Vec<MemoryRecord>, String> {
     let session = active_vault(&app)?;
     vault_ref(&session)?.memory().map_err(err)
@@ -1105,6 +1129,7 @@ pub fn run() {
             connect_provider,
             cancel_provider_authorization,
             disconnect_provider,
+            finalize_provider_cleanup,
             touch_vault,
             purge_expired_previews,
             lock_vault,

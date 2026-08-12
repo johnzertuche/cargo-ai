@@ -444,6 +444,17 @@ fn disconnect_provider(vault: &Vault, grant_id: Uuid, yes: bool) -> Result<()> {
         serde_json::to_string_pretty(&provider_grant_preview(&grant))?
     );
     require_confirmation("DISCONNECT", yes)?;
+    if grant.status == GrantStatus::LocalCleanupPending {
+        let operation_id = grant
+            .current_revocation_id
+            .ok_or_else(|| anyhow::anyhow!("provider cleanup operation not found"))?;
+        let latest = vault.finalize_provider_revocation(operation_id)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&provider_grant_preview(&latest))?
+        );
+        return Ok(());
+    }
     let (grant, access, refresh, operation_id) = if let Some(operation_id) =
         grant.current_revocation_id
     {

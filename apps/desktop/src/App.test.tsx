@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
@@ -147,5 +147,60 @@ describe("manual connection creation", () => {
       args: ["  spaced value  ", ""],
       url: null,
     }));
+  });
+});
+
+describe("provider local cleanup recovery", () => {
+  const connection = {
+    id: "connection-cleanup",
+    name: "cleanup-mcp",
+    transport: "streamable_http",
+    command: null,
+    args: [],
+    url: "https://mcp.example.com/mcp",
+    environment_keys: [],
+    metadata: { source: "manual" },
+  };
+  const grant = {
+    id: "grant-cleanup",
+    connection_id: connection.id,
+    resource: connection.url,
+    issuer: "https://issuer.example.com",
+    scopes: ["read"],
+    access_expires_at: null,
+    status: "local_cleanup_pending",
+    created_at: "2026-08-12T00:00:00Z",
+    last_verified_at: "2026-08-12T00:10:00Z",
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_state") return {
+        ...emptyState,
+        profile: { id: "profile-1", display_name: "Alex", created_at: "2026-08-12T00:00:00Z" },
+        connection_count: 1,
+        provider_grants: [grant],
+      };
+      if (command === "connection_records") return [connection];
+      if (command === "finalize_provider_cleanup") return { ...grant, status: "verified_revoked" };
+      throw new Error(`Unexpected invoke: ${command}`);
+    });
+  });
+
+  afterEach(cleanup);
+
+  it("exposes and runs local-only cleanup after provider evidence is complete", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Alex's vault" });
+    fireEvent.click(screen.getByRole("button", { name: /connections/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /finish local cleanup/i }));
+    const dialog = await screen.findByRole("dialog", { name: /finish local cleanup/i });
+    expect(invokeMock).not.toHaveBeenCalledWith("finalize_provider_cleanup", expect.anything());
+    expect(dialog).toHaveTextContent(/performs no provider network request/i);
+    fireEvent.click(screen.getByRole("checkbox", { name: /irreversibly deletes/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: /finish local cleanup/i }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("finalize_provider_cleanup", { grantId: grant.id }));
+    expect(await screen.findByText(/local keychain credential references were deleted/i)).toBeVisible();
   });
 });

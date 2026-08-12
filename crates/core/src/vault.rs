@@ -1142,32 +1142,44 @@ impl Vault {
     /// Finalizes a verified provider revocation only after both local credential
     /// references have been idempotently removed from the OS credential store.
     pub fn finalize_provider_revocation(&self, operation_id: Uuid) -> Result<ProviderGrant> {
-        let mut operation = self
-            .revocation_operation(operation_id)?
-            .context("revocation operation was not found")?;
-        let mut grant = self
-            .provider_grant(operation.grant_id)?
-            .context("provider grant was not found")?;
-        if grant.status != crate::GrantStatus::LocalCleanupPending {
-            bail!("provider revocation evidence is not complete");
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut operation = self
+                .revocation_operation(operation_id)?
+                .context("revocation operation was not found")?;
+            let mut grant = self
+                .provider_grant(operation.grant_id)?
+                .context("provider grant was not found")?;
+            // Ownership, current operation ID, revision, and evidence state are
+            // validated while the write lock is held and before Keychain is
+            // touched. The in-memory terminal transition is persisted only
+            // after idempotent credential deletion succeeds.
+            crate::oauth::confirm_local_cleanup(&mut grant, &mut operation, Utc::now())?;
+            self.delete_secret_value(&grant.access_secret_ref)?;
+            if let Some(reference) = &grant.refresh_secret_ref {
+                self.delete_secret_value(reference)?;
+            }
+            self.put("provider_grants", grant.id, &grant)?;
+            self.put("revocations", operation.id, &operation)?;
+            self.release_provider_lifecycle(grant.connection_id, grant.id)?;
+            self.receipt(
+                "provider_revocation.local_cleanup_complete",
+                &operation.id.to_string(),
+                "success",
+                "credential-references-deleted",
+            )?;
+            Ok::<ProviderGrant, anyhow::Error>(grant)
+        })();
+        match result {
+            Ok(grant) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(grant)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        self.delete_secret_value(&grant.access_secret_ref)?;
-        if let Some(reference) = &grant.refresh_secret_ref {
-            self.delete_secret_value(reference)?;
-        }
-        crate::oauth::confirm_local_cleanup(&mut grant, &mut operation, Utc::now())?;
-        let transaction = self.db.unchecked_transaction()?;
-        self.put("provider_grants", grant.id, &grant)?;
-        self.put("revocations", operation.id, &operation)?;
-        self.release_provider_lifecycle(grant.connection_id, grant.id)?;
-        self.receipt(
-            "provider_revocation.local_cleanup_complete",
-            &operation.id.to_string(),
-            "success",
-            "credential-references-deleted",
-        )?;
-        transaction.commit()?;
-        Ok(grant)
     }
 
     pub fn deployment(&self, id: Uuid) -> Result<Option<ManagedDeployment>> {
