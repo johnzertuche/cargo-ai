@@ -1,14 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { siClaude, siCursor, siGithub, siX, siLinear, siPostgresql, siNotion } from "simple-icons";
 
 type Host = { name: string; status: "Connected" | "Ready" | "Not linked" };
 type Capability = { name: string; detail: string; status: string; scopes: string };
 type MemoryRecord = { type: string; title: string; content: string; disclosure: string };
 type Screen = "overview" | "stack" | "memory" | "activity";
 
-const iconMap = { Claude: siClaude, Cursor: siCursor, GitHub: siGithub, Grok: siX, Linear: siLinear, Postgres: siPostgresql, Notion: siNotion } as const;
+const iconMap = { Claude:"/brand-claude.svg", Cursor:"/brand-cursor.svg", GitHub:"/brand-github.svg", Grok:"/brand-grok.svg", Linear:"/brand-linear.svg", Postgres:"/brand-postgres.svg", Notion:"/brand-notion.svg" } as const;
 const seedHosts: Host[] = [{ name:"Claude",status:"Connected"},{name:"Cursor",status:"Connected"},{name:"Codex",status:"Ready"},{name:"GitHub",status:"Not linked"},{name:"Grok",status:"Not linked"}];
 const seedCapabilities: Capability[] = [
   {name:"GitHub",detail:"Repositories · Issues · Pull requests",status:"Healthy",scopes:"Read & write"},
@@ -28,7 +27,7 @@ const seedMemory: MemoryRecord[] = [
 function Logo({ name, size="md" }: { name:string; size?:"sm"|"md"|"lg" }) {
   const icon = iconMap[name as keyof typeof iconMap];
   if (!icon) return <span className={`brand-icon fallback ${size}`}>{name === "Codex" ? "◎" : name.slice(0,2).toUpperCase()}</span>;
-  return <span className={`brand-icon ${size}`} title={icon.title}><svg viewBox="0 0 24 24" role="img" aria-label={`${icon.title} logo`}><path d={icon.path}/></svg></span>;
+  return <span className={`brand-icon ${size}`} title={`${name} logo`}><img src={icon} alt={`${name} logo`}/></span>;
 }
 
 export default function Home() {
